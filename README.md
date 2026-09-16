@@ -154,7 +154,7 @@ public-read class while keeping the real findings. I have not built that yet, an
 going to claim a false positive rate for it in advance.
 
 If catching write-side IDOR in Next.js Server Actions in CI is something you'd use, the
-waitlist is here: [URL]
+waitlist is here: [https://tally.so/r/1ALZkb]
 
 ## License
 
