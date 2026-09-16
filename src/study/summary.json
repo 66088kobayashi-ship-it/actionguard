@@ -1,0 +1,12 @@
+{
+  "repositories_scanned": 259,
+  "scan_failures": 0,
+  "server_actions_using_service_role": 499,
+  "flagged": 111,
+  "guard_before_sink": 255,
+  "no_tainted_sink": 133,
+  "repositories_with_findings": 17,
+  "manually_reviewed": 4,
+  "confirmed_true_positive": 3,
+  "confirmed_false_positive": 1
+}

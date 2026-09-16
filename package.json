@@ -1,0 +1,12 @@
+{
+  "name": "actionguard",
+  "version": "0.1.0",
+  "description": "Static analysis for Next.js Server Actions: finds caller-supplied identifiers reaching privileged database queries without a guard",
+  "license": "MIT",
+  "bin": { "actionguard": "./dist/cli.js" },
+  "files": ["dist"],
+  "scripts": { "build": "tsc", "prepublishOnly": "npm run build" },
+  "keywords": ["nextjs", "server-actions", "static-analysis", "security", "supabase", "idor"],
+  "dependencies": { "ts-morph": "^21.0.1" },
+  "devDependencies": { "typescript": "^5.4.0", "@types/node": "^20.11.0" }
+}
