@@ -19,7 +19,11 @@ import * as path from "path";
 
 const SERVICE_KEY = ["SERVICE_ROLE", "SUPABASE_SERVICE_KEY", "sb_secret_"];
 const SINK = ["eq", "in", "match", "insert", "update", "upsert", "delete", "filter", "or"];
-const GUARD_NAME = /^(require|verify|validate|assert|ensure|check|authori[sz]e|protect|can|is)[A-Z_]?/;
+// A sink only counts when it sits on a database query chain: `<client>.from(...)...`.
+// Without this, Array.prototype.filter, String.prototype.match and
+// hash.update(...) all look like queries.
+const QUERY_ROOT = new Set(["from"]);
+// Calls that are authentication by themselves, matched by exact name.
 const GUARD_MEMBER = new Set([
   "getUser", "getSession", "getClaims", "protect", "getToken", "verifyIdToken",
 ]);
@@ -27,6 +31,13 @@ const AUTH_FN = new Set([
   "currentUser", "auth", "getServerSession", "clerkClient",
   "getCurrentUser", "getAuthUser", "getSessionUser", "getUser", "getSession",
 ]);
+// Name fallback, used only when the callee's source is not in the repository
+// (an uninstalled package). The uppercase letter is required: `isNaN`,
+// `canonicalize` and `checkAndGrantBadges` must not read as guards. `validate*`,
+// `check*`, `is*` and `can*` are left out because they are mostly input checks.
+const GUARD_NAME = /^(require|verify|assert|ensure|authori[sz]e|protect)[A-Z]/;
+// How many helper calls deep to look for an auth call.
+const MAX_HELPER_DEPTH = 3;
 const FACTORY = (n: string) =>
   /create.*client/i.test(n) || /get.*client/i.test(n) || n.toLowerCase().includes("supabase");
 
@@ -57,6 +68,77 @@ function usesServiceRoleClient(node: any): boolean {
   return false;
 }
 
+function calleeName(call: any): string {
+  const e = call.getExpression();
+  return Node.isPropertyAccessExpression(e) ? e.getName() : e.getText();
+}
+
+// The function body a call resolves to, if its source is in the repository.
+// Declaration files and node_modules return undefined.
+function localCallee(call: any): any | undefined {
+  const e = call.getExpression();
+  const id = Node.isPropertyAccessExpression(e) ? e.getNameNode()
+    : Node.isIdentifier(e) ? e : undefined;
+  if (!id) return undefined;
+  for (const d of resolveSymbol(id.getSymbol())?.getDeclarations() ?? []) {
+    const sf = d.getSourceFile();
+    if (sf.isDeclarationFile() || sf.isInNodeModules()) continue;
+    if (Node.isFunctionDeclaration(d) || Node.isMethodDeclaration(d)) return d;
+    if (Node.isVariableDeclaration(d)) {
+      const init = d.getInitializer();
+      if (init && (Node.isArrowFunction(init) || Node.isFunctionExpression(init))) return init;
+    }
+  }
+  return undefined;
+}
+
+// A call is a guard if it is a known auth call, or if it is a function in this
+// repository that makes one within MAX_HELPER_DEPTH levels. A local helper is
+// judged by what it does, never by its name, so `getProfileOrThrow` counts and
+// a local `validateEmail` does not.
+function isGuardCall(call: any, depth: number, path: Set<any>): boolean {
+  const name = calleeName(call);
+  if (GUARD_MEMBER.has(name) || AUTH_FN.has(name)) return true;
+  const fn = localCallee(call);
+  if (!fn) return GUARD_NAME.test(name);
+  if (depth >= MAX_HELPER_DEPTH || path.has(fn)) return false;
+  path.add(fn);
+  const found = fn.getDescendantsOfKind(SyntaxKind.CallExpression)
+    .some((c: any) => isGuardCall(c, depth + 1, path));
+  path.delete(fn);
+  return found;
+}
+
+// Does this receiver come from `<client>.from(...)`? Follows one local variable,
+// so `let q = sb.from("t").select(); q = q.eq("id", id)` is still a query.
+function isQueryChain(expr: any): boolean {
+  let cur = expr;
+  for (let steps = 0; cur && steps < 50; steps++) {
+    if (Node.isCallExpression(cur)) {
+      const e = cur.getExpression();
+      if (Node.isPropertyAccessExpression(e) && QUERY_ROOT.has(e.getName())) {
+        const recv = e.getExpression();
+        if (!(Node.isIdentifier(recv) && recv.getText() === "Array")) return true;
+      }
+      cur = e;
+    } else if (
+      Node.isPropertyAccessExpression(cur) || Node.isAwaitExpression(cur) ||
+      Node.isParenthesizedExpression(cur) || Node.isNonNullExpression(cur) ||
+      Node.isAsExpression(cur)
+    ) {
+      cur = cur.getExpression();
+    } else if (Node.isIdentifier(cur)) {
+      const d = resolveSymbol(cur.getSymbol())?.getDeclarations()?.[0];
+      const init = d && Node.isVariableDeclaration(d) ? d.getInitializer() : undefined;
+      if (!init) return false;
+      cur = init;
+    } else {
+      return false;
+    }
+  }
+  return false;
+}
+
 function classify(node: any, repoPath: string): Verdict {
   const params = node.getParameters();
   if (params.length === 0) return "no_tainted_sink";
@@ -69,9 +151,15 @@ function classify(node: any, repoPath: string): Verdict {
       (resolveSymbol(i.getSymbol())?.getDeclarations() ?? []).some((x: any) => x === decl)
     );
 
-  const taintedDecls = new Set<any>(params);
+  // Destructured parameters (`{ userId }`) declare their names on binding
+  // elements, not on the parameter, so both have to be roots.
+  const roots: any[] = [];
+  for (const p of params) {
+    roots.push(p, ...p.getNameNode().getDescendantsOfKind(SyntaxKind.BindingElement));
+  }
+  const taintedDecls = new Set<any>(roots);
   const tainted = new Set<any>();
-  for (const p of params) refsOf(p).forEach((n) => tainted.add(n));
+  for (const r of roots) refsOf(r).forEach((n) => tainted.add(n));
 
   // One hop of propagation, so `const id = formData.get("id")` stays tainted.
   for (let pass = 0; pass < 2; pass++) {
@@ -92,6 +180,7 @@ function classify(node: any, repoPath: string): Verdict {
   for (const call of node.getDescendantsOfKind(SyntaxKind.CallExpression)) {
     const expr = call.getExpression();
     if (!Node.isPropertyAccessExpression(expr) || !SINK.includes(expr.getName())) continue;
+    if (!isQueryChain(expr.getExpression())) continue;
     for (const arg of call.getArguments()) {
       for (const t of tainted as any) {
         if (t.getPos() >= arg.getPos() && t.getEnd() <= arg.getEnd()) {
@@ -106,11 +195,7 @@ function classify(node: any, repoPath: string): Verdict {
   // query is not authorization.
   for (const call of node.getDescendantsOfKind(SyntaxKind.CallExpression)) {
     if (call.getPos() >= sinkPos) continue;
-    const e = call.getExpression();
-    const name = Node.isPropertyAccessExpression(e) ? e.getName() : e.getText();
-    if (GUARD_MEMBER.has(name) || AUTH_FN.has(name) || GUARD_NAME.test(name)) {
-      return "guard_before_sink";
-    }
+    if (isGuardCall(call, 0, new Set())) return "guard_before_sink";
   }
   return "flagged";
 }

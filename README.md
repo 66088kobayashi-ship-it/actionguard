@@ -37,14 +37,24 @@ which is the correct behaviour for a misapplied tool, not a defect in it.
 An AST pass (ts-morph) over exported functions in `"use server"` files that construct or
 import a `service_role` client:
 
-1. Build a taint set from the function's parameters via symbol resolution, with one hop of
-   propagation through local variable assignments.
+1. Build a taint set from the function's parameters via symbol resolution — including
+   destructured ones (`{ userId }`) — with one hop of propagation through local variable
+   assignments.
 2. Find the first `.eq/.in/.match/.insert/.update/.upsert/.delete` call receiving a tainted
-   node.
-3. Look for a guard call (`require*`, `verify*`, `validate*`, `assert*`, `.getUser()`,
-   `.getSession()`, `auth()`, `currentUser()`, …) positioned **before** that sink.
+   node, counting only calls that sit on a `<client>.from(...)` query chain.
+3. Look for a guard call positioned **before** that sink. A guard is a known auth call
+   (`.getUser()`, `.getSession()`, `auth()`, `currentUser()`, …), or a function in the
+   repository that makes one within three helper levels. Local helpers are judged by what
+   they do, not by their name: `getProfileOrThrow()` counts, a local `validateEmail()` does
+   not. A name pattern (`require*`, `verify*`, `assert*`, …) is used only when the callee's
+   source is not in the repository.
 
 No guard before the sink → flagged. Exit code 1 if anything is flagged, so it drops into CI.
+
+`npm test` runs the scanner against `test/fixtures/` and checks each verdict.
+
+> The study below was run with v0.1.0, which matched guards by name prefix only and did not
+> follow helpers or destructured parameters. It is being re-measured with the rules above.
 
 ## The corpus
 

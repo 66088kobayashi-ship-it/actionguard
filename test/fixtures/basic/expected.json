@@ -1,0 +1,15 @@
+{
+  "awardXp": "flagged",
+  "renameTeam": "guard_before_sink",
+  "deletePost": "flagged",
+  "setRole": "flagged",
+  "setXp": "flagged",
+  "countMine": "no_tainted_sink",
+  "archiveProject": "guard_before_sink",
+  "removeMember": "flagged",
+  "banUser": "flagged",
+  "updateEmail": "flagged",
+  "closeAccount": "guard_before_sink",
+  "moveTask": "flagged",
+  "purgeLogs": "flagged"
+}

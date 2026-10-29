@@ -5,7 +5,7 @@
   "license": "MIT",
   "bin": { "actionguard": "./dist/cli.js" },
   "files": ["dist"],
-  "scripts": { "build": "tsc", "prepublishOnly": "npm run build" },
+  "scripts": { "build": "tsc", "test": "npm run build && node test/run.mjs", "prepublishOnly": "npm test" },
   "keywords": ["nextjs", "server-actions", "static-analysis", "security", "supabase", "idor"],
   "dependencies": { "ts-morph": "^21.0.1" },
   "devDependencies": { "typescript": "^5.4.0", "@types/node": "^20.11.0" }
