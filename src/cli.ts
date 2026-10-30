@@ -30,14 +30,23 @@ const GUARD_MEMBER = new Set([
 const AUTH_FN = new Set([
   "currentUser", "auth", "getServerSession", "clerkClient",
   "getCurrentUser", "getAuthUser", "getSessionUser", "getUser", "getSession",
+  // next/navigation: these end the request with 401 / 403.
+  "unauthorized", "forbidden",
 ]);
+// A hand-written check counts when it ends in an auth error or a login redirect:
+// `if (!ok) throw new Error("Unauthorized")`, `redirect("/login")`.
+const AUTH_ERROR = /unauthori[sz]ed|unauthenticated|forbidden|not (logged|signed) in|not allowed|no session|login required/i;
+const LOGIN_PATH = /^['"`]\/?(login|signin|sign-in|auth|admin\/login)\b/i;
 // Name fallback, used only when the callee's source is not in the repository
 // (an uninstalled package). The uppercase letter is required: `isNaN`,
 // `canonicalize` and `checkAndGrantBadges` must not read as guards. `validate*`,
 // `check*`, `is*` and `can*` are left out because they are mostly input checks.
 const GUARD_NAME = /^(require|verify|assert|ensure|authori[sz]e|protect)[A-Z]/;
-// How many helper calls deep to look for an auth call.
+// How many helper calls deep to follow when tracing a client.
 const MAX_HELPER_DEPTH = 3;
+// How many helper calls deep to look for an auth call. Real code nests guards:
+// requireSuperAdmin -> requireRole -> requireAuth -> getProfile -> getUser.
+const GUARD_DEPTH = 6;
 const FACTORY = (n: string) =>
   /create.*client/i.test(n) || /get.*client/i.test(n) || n.toLowerCase().includes("supabase");
 
@@ -117,6 +126,17 @@ function localCallee(call: any): any | undefined {
       if (init && Node.isCallExpression(init)) {
         const fnArg = init.getArguments().find((a: any) => Node.isArrowFunction(a) || Node.isFunctionExpression(a));
         if (fnArg) return fnArg;
+        // `export const getRep = cache(loadRep)`
+        const idArg = init.getArguments().find((a: any) => Node.isIdentifier(a));
+        if (idArg) {
+          for (const d2 of resolveSymbol(idArg.getSymbol())?.getDeclarations() ?? []) {
+            if (Node.isFunctionDeclaration(d2)) return d2;
+            if (Node.isVariableDeclaration(d2)) {
+              const i2 = d2.getInitializer();
+              if (i2 && (Node.isArrowFunction(i2) || Node.isFunctionExpression(i2))) return i2;
+            }
+          }
+        }
       }
     }
   }
@@ -130,14 +150,28 @@ function localCallee(call: any): any | undefined {
 function isGuardCall(call: any, depth: number, path: Set<any>): boolean {
   const name = calleeName(call);
   if (GUARD_MEMBER.has(name) || AUTH_FN.has(name)) return true;
+  if (isLoginRedirect(call)) return true;
   const fn = localCallee(call);
   if (!fn) return GUARD_NAME.test(name);
-  if (depth >= MAX_HELPER_DEPTH || path.has(fn)) return false;
+  if (depth >= GUARD_DEPTH || path.has(fn)) return false;
   path.add(fn);
-  const found = fn.getDescendantsOfKind(SyntaxKind.CallExpression)
+  const found = throwsAuthError(fn) || fn.getDescendantsOfKind(SyntaxKind.CallExpression)
     .some((c: any) => isGuardCall(c, depth + 1, path));
   path.delete(fn);
   return found;
+}
+
+// `redirect("/login")`, `redirect("/auth/sign-in?next=...")`
+function isLoginRedirect(call: any): boolean {
+  if (calleeName(call) !== "redirect") return false;
+  const a = call.getArguments()[0];
+  return !!a && LOGIN_PATH.test(a.getText());
+}
+
+// `throw new Error("Unauthorized")` and the like, anywhere in the node.
+function throwsAuthError(node: any): boolean {
+  return node.getDescendantsOfKind(SyntaxKind.ThrowStatement)
+    .some((t: any) => AUTH_ERROR.test(t.getText()));
 }
 
 // If this receiver comes from `<client>.from(...)`, return `<client>`. Follows one
@@ -360,6 +394,10 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
     if (call.getPos() >= sinkPos) continue;
     if (isGuardCall(call, 0, new Set())) guarded = true;
   }
+  if (!guarded) {
+    guarded = node.getDescendantsOfKind(SyntaxKind.ThrowStatement)
+      .some((t: any) => t.getPos() < sinkPos && AUTH_ERROR.test(t.getText()));
+  }
   if (!guarded) return "flagged";
 
   // A role check on user_metadata is not authorization: users can rewrite their
@@ -391,8 +429,6 @@ function unwrapAction(init: any): { body: any; safeAction: boolean } | undefined
   const safeAction = Node.isPropertyAccessExpression(e) && ["action", "stateAction"].includes(e.getName());
   return { body: fn, safeAction };
 }
-
-const AUTH_ERROR = /unauthori[sz]ed|unauthenticated|forbidden|not (logged|signed) in|not allowed|no session|login required/i;
 
 // A middleware callback (or wrapper body) authenticates if it makes an auth call,
 // or throws an auth error. In `.use(async ({ next }) => { if (!user) throw
@@ -477,41 +513,164 @@ function isServerOnlyImporter(sf: any): boolean {
   return sf.getImportDeclarations().some((i: any) => i.getModuleSpecifierValue() === "server-only");
 }
 
-// For each "use server" file: export names some client-capable file imports
-// ("*" = all). A file with no entry here is imported by nobody, or only by
-// server-only modules.
+const isTestFile = (sf: any) =>
+  /\.(test|spec)\.[cm]?[tj]sx?$/.test(sf.getFilePath()) ||
+  /\/(__tests__|__mocks__|e2e|cypress|playwright)\//.test(sf.getFilePath());
+
+const isUseClientFile = (sf: any) => {
+  const first = sf.getStatements()[0];
+  return !!first && Node.isExpressionStatement(first) &&
+    /^['"]use client['"];?$/.test(first.getText().trim());
+};
+
+// Value imports only: `import type { X }` and `import { type X }` never reach the bundle.
+function valueImports(sf: any): { decl: any; target: any; names: string[]; star: boolean; locals: any[] }[] {
+  const out: any[] = [];
+  for (const decl of sf.getImportDeclarations()) {
+    if (decl.isTypeOnly()) continue;
+    const target = decl.getModuleSpecifierSourceFile();
+    if (!target) continue;
+    const named = decl.getNamedImports().filter((n: any) => !n.isTypeOnly());
+    const ns = decl.getNamespaceImport();
+    const def = decl.getDefaultImport();
+    if (!named.length && !ns && !def && decl.getNamedImports().length) continue; // all type-only
+    out.push({
+      decl, target,
+      names: named.map((n: any) => n.getName()),
+      star: !!ns || !!def,
+      locals: [...named.map((n: any) => n.getAliasNode() ?? n.getNameNode()), ...(ns ? [ns] : []), ...(def ? [def] : [])],
+    });
+  }
+  return out;
+}
+
+// Resolve a module specifier the way the compiler would: relative paths, then
+// tsconfig `paths` aliases (`@/lib/x`). Returns the source file, if in the project.
+function resolveSpecifier(project: any, from: any, spec: string): any | undefined {
+  const exts = ["", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx", "/index.js"];
+  const tryBase = (base: string) => {
+    for (const e of exts) {
+      const f = project.getSourceFile(base + e);
+      if (f) return f;
+    }
+    return undefined;
+  };
+  if (spec.startsWith(".")) return tryBase(path.resolve(path.dirname(from.getFilePath()), spec));
+  const opts = project.getCompilerOptions();
+  const baseDir = opts.baseUrl ?? (opts.configFilePath ? path.dirname(String(opts.configFilePath)) : undefined);
+  if (!baseDir) return undefined;
+  for (const [pattern, targets] of Object.entries(opts.paths ?? {}) as [string, string[]][]) {
+    const star = pattern.indexOf("*");
+    const prefix = star >= 0 ? pattern.slice(0, star) : pattern;
+    if (star >= 0 ? !spec.startsWith(prefix) : spec !== pattern) continue;
+    const rest = star >= 0 ? spec.slice(prefix.length) : "";
+    for (const t of targets) {
+      const f = tryBase(path.resolve(baseDir, t.replace("*", rest)));
+      if (f) return f;
+    }
+  }
+  return undefined;
+}
+
+// Is `local` (an imported binding) used other than as the callee of a direct call?
+// A server component that runs `await getDetails(id)` does not expose the action;
+// one that renders `<form action={save}>` or passes it to a client component does.
+function usedAsValue(sf: any, local: any): boolean {
+  const name = local.getText();
+  for (const id of sf.getDescendantsOfKind(SyntaxKind.Identifier)) {
+    if (id === local || id.getText() !== name) continue;
+    if (id.getFirstAncestorByKind(SyntaxKind.ImportDeclaration)) continue;
+    let node: any = id;
+    // ns.fn(...) for namespace imports
+    if (Node.isPropertyAccessExpression(node.getParent()) && node.getParent().getExpression() === node) node = node.getParent();
+    const par = node.getParent();
+    if (Node.isCallExpression(par) && par.getExpression() === node) continue;
+    if (Node.isAwaitExpression(par)) continue;
+    return true;
+  }
+  return false;
+}
+
+// For each "use server" file: the export names that can end up in the browser
+// ("*" = all). Since Next.js 15 only those get an action ID. An action is exposed
+// when a client module (a "use client" file, or anything it imports, directly or
+// not) imports it, or when a server module passes it on as a value instead of
+// calling it. Test files and type-only imports do not count.
 function exposedExports(project: any): Map<any, Set<string>> {
   const out = new Map<any, Set<string>>();
   const mark = (sf: any, name: string) => {
     if (!out.has(sf)) out.set(sf, new Set());
     out.get(sf)!.add(name);
   };
-  for (const sf of project.getSourceFiles()) {
-    const serverOnly = isServerOnlyImporter(sf);
-    for (const decl of [...sf.getImportDeclarations(), ...sf.getExportDeclarations()]) {
-      const target = decl.getModuleSpecifierSourceFile?.();
-      if (!target || !isUseServerFile(target)) continue;
-      // A re-export from a "use server" file exposes it through that file's IDs.
-      const reexport = Node.isExportDeclaration(decl);
-      if (serverOnly && !reexport) continue;
-      if (reexport) {
-        const named = decl.getNamedExports();
-        if (named.length === 0) mark(target, "*");
-        named.forEach((n: any) => mark(target, n.getName()));
+  // Mark `names` imported from `mod`, following barrels (`export * from`,
+  // `export { a as b } from`) to the "use server" file that defines them. Only
+  // the names actually imported count, not everything the barrel re-exports.
+  const markThrough = (mod: any, names: string[] | "*", depth = 0) => {
+    if (!mod || depth > 5) return;
+    if (isUseServerFile(mod)) {
+      if (names === "*") mark(mod, "*"); else names.forEach((n) => mark(mod, n));
+    }
+    for (const decl of mod.getExportDeclarations()) {
+      if (decl.isTypeOnly()) continue;
+      const target = decl.getModuleSpecifierSourceFile();
+      if (!target || target.isDeclarationFile() || target.isInNodeModules()) continue;
+      const named = decl.getNamedExports().filter((n: any) => !n.isTypeOnly());
+      if (!named.length && !decl.getNamespaceExport()) {
+        markThrough(target, names, depth + 1);                      // export * from
         continue;
       }
-      if (decl.getNamespaceImport() || decl.getDefaultImport()) mark(target, "*");
-      decl.getNamedImports().forEach((n: any) => mark(target, n.getName()));
+      const picked = named
+        .filter((n: any) => names === "*" || names.includes(n.getAliasNode()?.getText() ?? n.getName()))
+        .map((n: any) => n.getName());
+      if (picked.length) markThrough(target, picked, depth + 1);
     }
-    // Dynamic import("./actions"): too loose to resolve, so expose everything it might be.
-    if (!serverOnly) {
+  };
+  const files = project.getSourceFiles().filter((f: any) => !isTestFile(f));
+
+  // Client graph: "use client" files and everything they import.
+  const client = new Set<any>();
+  const queue = files.filter(isUseClientFile);
+  queue.forEach((f: any) => client.add(f));
+  while (queue.length) {
+    const f = queue.pop();
+    for (const imp of valueImports(f)) {
+      const t = imp.target;
+      if (client.has(t) || isUseServerFile(t) || t.isDeclarationFile() || t.isInNodeModules()) continue;
+      client.add(t);
+      queue.push(t);
+    }
+  }
+
+  for (const sf of files) {
+    const inClient = client.has(sf);
+    if (isUseServerFile(sf)) continue;   // server-to-server calls expose nothing
+    for (const imp of valueImports(sf)) {
+      if (inClient) {
+        markThrough(imp.target, imp.star ? "*" : imp.names);
+        continue;
+      }
+      if (isServerOnlyImporter(sf) && !/\.(t|j)sx$/.test(sf.getFilePath())) continue;
+      const named = imp.decl.getNamedImports().filter((n: any) => !n.isTypeOnly());
+      const used = named
+        .filter((n: any) => usedAsValue(sf, n.getAliasNode() ?? n.getNameNode()))
+        .map((n: any) => n.getName());
+      if (used.length) markThrough(imp.target, used);
+      for (const l of imp.locals.slice(named.length)) {
+        if (usedAsValue(sf, l)) markThrough(imp.target, "*");
+      }
+    }
+    // Dynamic import("./actions") from client code: expose everything it might be.
+    if (inClient) {
       for (const c of sf.getDescendantsOfKind(SyntaxKind.CallExpression)) {
         if (c.getExpression().getKind() !== SyntaxKind.ImportKeyword) continue;
-        const spec = c.getArguments()[0]?.getText().replace(/['"`]/g, "") ?? "";
-        const base = path.basename(spec);
-        for (const t of project.getSourceFiles()) {
-          if (isUseServerFile(t) && path.basename(t.getFilePath()).replace(/\.(t|j)sx?$/, "") === base) mark(t, "*");
+        const arg = c.getArguments()[0];
+        if (!arg || !(Node.isStringLiteral(arg) || Node.isNoSubstitutionTemplateLiteral(arg))) {
+          // import(someVariable): cannot tell which module, so assume any.
+          files.filter(isUseServerFile).forEach((t: any) => mark(t, "*"));
+          continue;
         }
+        const target = resolveSpecifier(project, sf, arg.getLiteralText());
+        if (target) markThrough(target, "*");
       }
     }
   }

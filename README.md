@@ -52,8 +52,10 @@ only `parsedInput` is treated as caller-supplied.
    Supabase Admin API calls (`.auth.admin.deleteUser(id)`, `updateUserById`, …) are sinks
    too, since they only run with a service_role key.
 3. Look for a guard call positioned **before** that sink. A guard is a known auth call
-   (`.getUser()`, `.getSession()`, `auth()`, `currentUser()`, …), or a function in the
-   repository that makes one within three helper levels. Local helpers are judged by what
+   (`.getUser()`, `.getSession()`, `auth()`, `currentUser()`, `unauthorized()`, …), a
+   hand-written check that throws an auth error (`throw new Error("Unauthorized")`) or
+   redirects to a login page, or a function in the repository that does any of these
+   within six helper levels (`cache(loadUser)` wrappers are followed). Local helpers are judged by what
    they do, not by their name: `getProfileOrThrow()` counts, a local `validateEmail()` does
    not. A name pattern (`require*`, `verify*`, `assert*`, …) is used only when the callee's
    source is not in the repository. For a wrapped action, the wrapper or the client's
@@ -69,8 +71,11 @@ only `parsedInput` is treated as caller-supplied.
 | `guard_before_sink` / `no_tainted_sink` | passed | 0 |
 
 `unreferenced` applies only when the nearest `package.json` pins `next` to 15 or later. An
-export counts as referenced when any file other than a route handler, `middleware.ts`, a
-`"use server"` file or a `server-only` module imports it. It is still worth fixing: the
+export counts as referenced when a client module imports it (a `"use client"` file, or any
+module such a file imports, directly or through barrels and `import()`), or when a server
+component passes it on as a value (`<form action={save}>`, a prop) instead of calling it.
+Type-only imports and test files do not count. Only the names actually imported through a
+barrel count, not everything it re-exports. It is still worth fixing: the
 day a client component imports it, it becomes an endpoint.
 
 Exit code 1 if anything is `flagged` or `weak_guard`, so it drops into CI.

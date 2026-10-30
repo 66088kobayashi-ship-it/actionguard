@@ -77,7 +77,7 @@ export async function moveTask(taskId: string) {
   await q;
 }
 
-// M: auth four helpers deep, past the limit. Expect: flagged (documented limit)
+// M: auth four helpers deep (d1 -> d2 -> d3 -> d4 -> getUser). Expect: guard_before_sink
 export async function purgeLogs(orgId: string) {
   await d1();
   await supabaseAdmin.from("logs").delete().eq("org_id", orgId);
@@ -160,4 +160,31 @@ export const bumpLikes = async (slug: string) => {
 export async function renameTeam2(teamId: string, name: string) {
   await requireUser();
   await supabaseAdmin.from("teams").update({ name }).eq("id", teamId);
+}
+
+import { requireRep, requireAdminAuth } from "@/lib/rep";
+import { redirect } from "next/navigation";
+
+// Y1: guard behind cache(namedFn). Expect: guard_before_sink
+export async function savePitch(profileId: string, pitch: string) {
+  await requireRep();
+  await supabaseAdmin.from("profiles").update({ pitch }).eq("id", profileId);
+}
+
+// Y2: custom check that throws an auth error. Expect: guard_before_sink
+export async function editQuestion(questionId: string, text: string) {
+  await requireAdminAuth();
+  await supabaseAdmin.from("questions").update({ text }).eq("id", questionId);
+}
+
+// Y3: inline check ending in a login redirect. Expect: guard_before_sink
+export async function hideComment(commentId: string, token?: string) {
+  if (token !== process.env.MOD_TOKEN) redirect("/login");
+  await supabaseAdmin.from("comments").update({ hidden: true }).eq("id", commentId);
+}
+
+// Y4: a redirect elsewhere is not a guard. Expect: flagged
+export async function archiveThread(threadId: string, back?: string) {
+  if (!back) redirect("/threads");
+  await supabaseAdmin.from("threads").update({ archived: true }).eq("id", threadId);
 }

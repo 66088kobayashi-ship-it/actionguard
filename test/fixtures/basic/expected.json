@@ -11,7 +11,7 @@
   "updateEmail": "flagged",
   "closeAccount": "guard_before_sink",
   "moveTask": "flagged",
-  "purgeLogs": "flagged",
+  "purgeLogs": "guard_before_sink",
   "saveDraft": "no_tainted_sink",
   "readOrgFlags": "flagged",
   "resetQuota": "flagged",
@@ -23,5 +23,9 @@
   "pinPost": "guard_before_sink",
   "bumpViews": "ignored",
   "bumpLikes": "ignored",
-  "renameTeam2": "guard_before_sink"
+  "renameTeam2": "guard_before_sink",
+  "savePitch": "guard_before_sink",
+  "editQuestion": "guard_before_sink",
+  "hideComment": "guard_before_sink",
+  "archiveThread": "flagged"
 }

@@ -1,5 +1,13 @@
 {
   "revokeKey": "flagged",
   "getKeyForUser": "unreferenced",
-  "markKeyInvalid": "unreferenced"
+  "markKeyInvalid": "unreferenced",
+  "getUserDetails": "unreferenced",
+  "banUser": "flagged",
+  "deleteNote": "flagged",
+  "countUserRows": "unreferenced",
+  "renameUser": "flagged",
+  "refundOrder": "flagged",
+  "getInvoice": "unreferenced",
+  "purgeCache": "flagged"
 }
