@@ -20,5 +20,8 @@
   "clearMyCart": "no_tainted_sink",
   "removeAccount": "flagged",
   "promote": "weak_guard",
-  "pinPost": "guard_before_sink"
+  "pinPost": "guard_before_sink",
+  "bumpViews": "ignored",
+  "bumpLikes": "ignored",
+  "renameTeam2": "guard_before_sink"
 }

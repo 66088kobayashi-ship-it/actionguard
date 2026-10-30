@@ -143,3 +143,21 @@ export async function promote(userId: string) {
 export const pinPost = withAuth(async (postId: string) => {
   await supabaseAdmin.from("posts").update({ pinned: true }).eq("id", postId);
 });
+
+// W: same shape as A, deliberately public. Expect: ignored
+// actionguard-ignore: anonymous view counter, slug is a public article key
+export async function bumpViews(slug: string) {
+  await supabaseAdmin.from("views").update({ n: 1 }).eq("slug", slug);
+}
+
+/* actionguard-ignore */
+export const bumpLikes = async (slug: string) => {
+  await supabaseAdmin.from("likes").update({ n: 1 }).eq("slug", slug);
+};
+
+// X: ignore comment on a passing action changes nothing. Expect: guard_before_sink
+// actionguard-ignore: not needed
+export async function renameTeam2(teamId: string, name: string) {
+  await requireUser();
+  await supabaseAdmin.from("teams").update({ name }).eq("id", teamId);
+}

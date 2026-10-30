@@ -45,6 +45,7 @@ type Verdict =
   | "flagged"            // tainted value reaches a service_role sink, no guard before it
   | "weak_guard"         // guarded, but the decision reads user_metadata (user-editable)
   | "unreferenced"       // would be flagged, but Next >= 15 does not expose it (see README)
+  | "ignored"            // would be reported, but marked `// actionguard-ignore: <reason>`
   | "guard_before_sink"
   | "no_tainted_sink";
 
@@ -60,6 +61,19 @@ interface Finding {
   file: string;
   fn: string;
   line: number;
+  reason?: string;   // for "ignored": the text after `actionguard-ignore:`
+}
+
+// `// actionguard-ignore: public view counter, slug is not an identity`
+// placed in the comments directly above the exported declaration.
+const IGNORE = /actionguard-ignore\b(?:\s*:\s*(.*?))?\s*(?:\*\/)?$/m;
+
+function ignoreReason(stmt: any): string | undefined {
+  for (const c of stmt.getLeadingCommentRanges?.() ?? []) {
+    const m = c.getText().match(IGNORE);
+    if (m) return (m[1] ?? "").trim() || "(no reason given)";
+  }
+  return undefined;
 }
 
 function resolveSymbol(s: TsSymbol | undefined): TsSymbol | undefined {
@@ -524,15 +538,15 @@ function scan(repoPath: string): Finding[] {
   for (const file of project.getSourceFiles()) {
     if (!isUseServerFile(file)) continue;
 
-    const candidates: [string, any, ClassifyOpts][] = [];
+    const candidates: [string, any, ClassifyOpts, any][] = [];
     for (const f of file.getFunctions().filter((f) => f.isExported())) {
-      candidates.push([f.getName() ?? "<anonymous>", f, {}]);
+      candidates.push([f.getName() ?? "<anonymous>", f, {}, f]);
     }
     for (const v of file.getVariableDeclarations().filter((v) => v.isExported())) {
       const init = v.getInitializer();
       if (!init) continue;
       if (Node.isArrowFunction(init) || Node.isFunctionExpression(init)) {
-        candidates.push([v.getName(), init, {}]);
+        candidates.push([v.getName(), init, {}, v.getVariableStatement()]);
         continue;
       }
       const w = unwrapAction(init);
@@ -540,12 +554,12 @@ function scan(repoPath: string): Finding[] {
         candidates.push([v.getName(), w.body, {
           safeAction: w.safeAction,
           preGuarded: chainAuthenticates(init, w.body),
-        }]);
+        }, v.getVariableStatement()]);
       }
     }
 
     const major = nextMajor(file.getFilePath(), repoPath);
-    for (const [name, node, opts] of candidates) {
+    for (const [name, node, opts, stmt] of candidates) {
       if (FACTORY(name)) continue;
       if (!usesServiceRoleClient(node)) continue;
       let verdict = classify(node, opts);
@@ -554,11 +568,17 @@ function scan(repoPath: string): Finding[] {
         const names = exposed.get(file);
         if (!names || !(names.has("*") || names.has(name))) verdict = "unreferenced";
       }
+      let reason: string | undefined;
+      if (verdict === "flagged" || verdict === "weak_guard" || verdict === "unreferenced") {
+        reason = stmt ? ignoreReason(stmt) : undefined;
+        if (reason) verdict = "ignored";
+      }
       findings.push({
         verdict,
         file: path.relative(repoPath, file.getFilePath()),
         fn: name,
         line: node.getStartLineNumber(),
+        ...(reason ? { reason } : {}),
       });
     }
   }
@@ -601,6 +621,7 @@ if (asJson) {
     flagged: flagged.length,
     weak_guard: findings.filter((f) => f.verdict === "weak_guard").length,
     unreferenced: findings.filter((f) => f.verdict === "unreferenced").length,
+    ignored: findings.filter((f) => f.verdict === "ignored").length,
     guard_before_sink: findings.filter((f) => f.verdict === "guard_before_sink").length,
     no_tainted_sink: findings.filter((f) => f.verdict === "no_tainted_sink").length,
     findings,
@@ -617,7 +638,7 @@ if (asJson) {
     }
     if (showAll) {
       for (const f of findings.filter((x) => x.verdict !== "flagged")) {
-        console.log(`  ok  ${f.file}:${f.line}  ${f.fn}  (${f.verdict})`);
+        console.log(`  ok  ${f.file}:${f.line}  ${f.fn}  (${f.verdict}${f.reason ? `: ${f.reason}` : ""})`);
       }
     }
     console.log(

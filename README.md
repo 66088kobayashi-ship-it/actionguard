@@ -64,6 +64,7 @@ only `parsedInput` is treated as caller-supplied.
 |---|---|---|
 | `flagged` | caller-supplied value reaches a service_role sink with no guard before it | 1 |
 | `weak_guard` | guarded, but the check reads `user_metadata`, which users can rewrite with `supabase.auth.updateUser` | 1 |
+| `ignored` | would be reported, but marked `// actionguard-ignore: <reason>` | 0 |
 | `unreferenced` | would be flagged, but on Next.js ≥ 15 no client code references it, so it gets no action ID | 0 |
 | `guard_before_sink` / `no_tainted_sink` | passed | 0 |
 
@@ -73,6 +74,20 @@ export counts as referenced when any file other than a route handler, `middlewar
 day a client component imports it, it becomes an endpoint.
 
 Exit code 1 if anything is `flagged` or `weak_guard`, so it drops into CI.
+
+### Suppressing a finding
+
+Some actions are meant to be public, and the syntax cannot say so: an anonymous view
+counter takes a `slug`, which is a public key, not an identity. Mark those in the comment
+directly above the export, with the reason:
+
+```ts
+// actionguard-ignore: anonymous view counter, slug is a public article key
+export async function incrementViewCount(slug: string) { ... }
+```
+
+The finding becomes `ignored` (exit code 0) and is listed with its reason under `--all`
+and in `--json`, so suppressions stay reviewable.
 
 `npm test` runs the scanner against `test/fixtures/` and checks each verdict.
 
