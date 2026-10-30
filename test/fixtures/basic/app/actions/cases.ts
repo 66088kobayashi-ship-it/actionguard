@@ -105,3 +105,41 @@ export async function resetQuota(accountId: string) {
   const admin = createAdminClient();
   await admin.from("quotas").update({ used: 0 }).eq("account_id", accountId);
 }
+
+import { actionClient, authActionClient, withAuth } from "@/lib/safe-action";
+
+// Q: next-safe-action behind an auth middleware. Expect: guard_before_sink
+export const deleteInvoice = authActionClient
+  .schema({})
+  .action(async ({ parsedInput: { invoiceId } }: any) => {
+    await supabaseAdmin.from("invoices").delete().eq("id", invoiceId);
+  });
+
+// R: next-safe-action, no auth middleware. Expect: flagged
+export const deleteInvoicePublic = actionClient
+  .schema({})
+  .action(async ({ parsedInput: { invoiceId } }: any) => {
+    await supabaseAdmin.from("invoices").delete().eq("id", invoiceId);
+  });
+
+// S: only ctx (from middleware) reaches the query. Expect: no_tainted_sink
+export const clearMyCart = actionClient.action(async ({ ctx }: any) => {
+  await supabaseAdmin.from("carts").delete().eq("user_id", ctx.user.id);
+});
+
+// T: Admin API with a caller-chosen id. Expect: flagged
+export async function removeAccount(userId: string) {
+  await supabaseAdmin.auth.admin.deleteUser(userId);
+}
+
+// U: guarded, but the role comes from user_metadata. Expect: weak_guard
+export async function promote(userId: string) {
+  const user = await requireUser();
+  if (user.user_metadata.role !== "admin") throw new Error("forbidden");
+  await supabaseAdmin.from("profiles").update({ role: "admin" }).eq("id", userId);
+}
+
+// V: wrapper that authenticates. Expect: guard_before_sink
+export const pinPost = withAuth(async (postId: string) => {
+  await supabaseAdmin.from("posts").update({ pinned: true }).eq("id", postId);
+});

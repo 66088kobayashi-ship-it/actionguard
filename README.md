@@ -35,7 +35,9 @@ which is the correct behaviour for a misapplied tool, not a defect in it.
 ## What this does
 
 An AST pass (ts-morph) over exported functions in `"use server"` files that construct or
-import a `service_role` client:
+import a `service_role` client. Wrapped actions count too: `withAuth(async (id) => ...)` and
+next-safe-action style `client.schema(s).action(async ({ parsedInput, ctx }) => ...)`, where
+only `parsedInput` is treated as caller-supplied.
 
 1. Build a taint set from the function's parameters via symbol resolution — including
    destructured ones (`{ userId }`) — with one hop of propagation through local variable
@@ -47,14 +49,30 @@ import a `service_role` client:
    library calls such as `createClient(url, key)`. A query on the user's anon/cookie client
    is skipped, since RLS applies to it, even if the action reads the service_role key
    elsewhere. A client that cannot be traced is kept.
+   Supabase Admin API calls (`.auth.admin.deleteUser(id)`, `updateUserById`, …) are sinks
+   too, since they only run with a service_role key.
 3. Look for a guard call positioned **before** that sink. A guard is a known auth call
    (`.getUser()`, `.getSession()`, `auth()`, `currentUser()`, …), or a function in the
    repository that makes one within three helper levels. Local helpers are judged by what
    they do, not by their name: `getProfileOrThrow()` counts, a local `validateEmail()` does
    not. A name pattern (`require*`, `verify*`, `assert*`, …) is used only when the callee's
-   source is not in the repository.
+   source is not in the repository. For a wrapped action, the wrapper or the client's
+   middleware chain (`authActionClient = actionClient.use(...)`) counts as a guard when it
+   makes an auth call or throws an auth error (`throw new Error("Unauthorized")`).
 
-No guard before the sink → flagged. Exit code 1 if anything is flagged, so it drops into CI.
+| Verdict | Meaning | Exit code |
+|---|---|---|
+| `flagged` | caller-supplied value reaches a service_role sink with no guard before it | 1 |
+| `weak_guard` | guarded, but the check reads `user_metadata`, which users can rewrite with `supabase.auth.updateUser` | 1 |
+| `unreferenced` | would be flagged, but on Next.js ≥ 15 no client code references it, so it gets no action ID | 0 |
+| `guard_before_sink` / `no_tainted_sink` | passed | 0 |
+
+`unreferenced` applies only when the nearest `package.json` pins `next` to 15 or later. An
+export counts as referenced when any file other than a route handler, `middleware.ts`, a
+`"use server"` file or a `server-only` module imports it. It is still worth fixing: the
+day a client component imports it, it becomes an endpoint.
+
+Exit code 1 if anything is `flagged` or `weak_guard`, so it drops into CI.
 
 `npm test` runs the scanner against `test/fixtures/` and checks each verdict.
 

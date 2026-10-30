@@ -14,5 +14,11 @@
   "purgeLogs": "flagged",
   "saveDraft": "no_tainted_sink",
   "readOrgFlags": "flagged",
-  "resetQuota": "flagged"
+  "resetQuota": "flagged",
+  "deleteInvoice": "guard_before_sink",
+  "deleteInvoicePublic": "flagged",
+  "clearMyCart": "no_tainted_sink",
+  "removeAccount": "flagged",
+  "promote": "weak_guard",
+  "pinPost": "guard_before_sink"
 }

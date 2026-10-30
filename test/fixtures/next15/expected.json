@@ -1,0 +1,5 @@
+{
+  "revokeKey": "flagged",
+  "getKeyForUser": "unreferenced",
+  "markKeyInvalid": "unreferenced"
+}

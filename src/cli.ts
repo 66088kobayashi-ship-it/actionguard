@@ -41,7 +41,19 @@ const MAX_HELPER_DEPTH = 3;
 const FACTORY = (n: string) =>
   /create.*client/i.test(n) || /get.*client/i.test(n) || n.toLowerCase().includes("supabase");
 
-type Verdict = "flagged" | "guard_before_sink" | "no_tainted_sink";
+type Verdict =
+  | "flagged"            // tainted value reaches a service_role sink, no guard before it
+  | "weak_guard"         // guarded, but the decision reads user_metadata (user-editable)
+  | "unreferenced"       // would be flagged, but Next >= 15 does not expose it (see README)
+  | "guard_before_sink"
+  | "no_tainted_sink";
+
+// Supabase Admin API calls. They only work with a service_role key, so they are
+// privileged sinks whatever client variable they hang off.
+const ADMIN_SINK = new Set([
+  "deleteUser", "updateUserById", "getUserById", "generateLink", "inviteUserByEmail",
+  "createUser", "signOut",
+]);
 
 interface Finding {
   verdict: Verdict;
@@ -234,7 +246,15 @@ function fnReturnsServiceRole(fn: any, depth: number, seen: Set<any>): boolean |
   return result;
 }
 
-function classify(node: any, repoPath: string): Verdict {
+interface ClassifyOpts {
+  // The action body is the callback of a next-safe-action style client:
+  // only `parsedInput` is caller-supplied; `ctx` comes from middleware.
+  safeAction?: boolean;
+  // A wrapper or middleware around the body performs authentication.
+  preGuarded?: boolean;
+}
+
+function classify(node: any, opts: ClassifyOpts = {}): Verdict {
   const params = node.getParameters();
   if (params.length === 0) return "no_tainted_sink";
 
@@ -249,12 +269,32 @@ function classify(node: any, repoPath: string): Verdict {
   // Destructured parameters (`{ userId }`) declare their names on binding
   // elements, not on the parameter, so both have to be roots.
   const roots: any[] = [];
-  for (const p of params) {
-    roots.push(p, ...p.getNameNode().getDescendantsOfKind(SyntaxKind.BindingElement));
+  let refFilter = (_n: any) => true;
+  if (opts.safeAction) {
+    const nameNode = params[0].getNameNode();
+    if (Node.isObjectBindingPattern(nameNode)) {
+      for (const el of nameNode.getElements()) {
+        const key = el.getPropertyNameNode()?.getText() ?? el.getName();
+        if (key === "parsedInput") {
+          roots.push(el, ...el.getDescendantsOfKind(SyntaxKind.BindingElement));
+        }
+      }
+    } else {
+      // `async (args) => ...`: only `args.parsedInput` is caller-supplied.
+      roots.push(params[0]);
+      refFilter = (n: any) => {
+        const par = n.getParent();
+        return Node.isPropertyAccessExpression(par) && par.getName() === "parsedInput";
+      };
+    }
+  } else {
+    for (const p of params) {
+      roots.push(p, ...p.getNameNode().getDescendantsOfKind(SyntaxKind.BindingElement));
+    }
   }
   const taintedDecls = new Set<any>(roots);
   const tainted = new Set<any>();
-  for (const r of roots) refsOf(r).forEach((n) => tainted.add(n));
+  for (const r of roots) refsOf(r).filter(refFilter).forEach((n) => tainted.add(n));
 
   // One hop of propagation, so `const id = formData.get("id")` stays tainted.
   for (let pass = 0; pass < 2; pass++) {
@@ -274,12 +314,20 @@ function classify(node: any, repoPath: string): Verdict {
   let sinkPos = Infinity;
   for (const call of node.getDescendantsOfKind(SyntaxKind.CallExpression)) {
     const expr = call.getExpression();
-    if (!Node.isPropertyAccessExpression(expr) || !SINK.includes(expr.getName())) continue;
-    const client = queryClient(expr.getExpression());
-    if (!client) continue;
-    // Skip queries traced to a non-privileged client; RLS applies to those.
-    // Untraceable clients stay in, since the action does use a service_role key.
-    if (clientIsServiceRole(client) === false) continue;
+    if (!Node.isPropertyAccessExpression(expr)) continue;
+    const recv = expr.getExpression();
+    const isAdminApi =
+      ADMIN_SINK.has(expr.getName()) &&
+      Node.isPropertyAccessExpression(recv) && recv.getName() === "admin" &&
+      /(^|\.)auth$/.test((recv as any).getExpression().getText());
+    if (!isAdminApi) {
+      if (!SINK.includes(expr.getName())) continue;
+      const client = queryClient(recv);
+      if (!client) continue;
+      // Skip queries traced to a non-privileged client; RLS applies to those.
+      // Untraceable clients stay in, since the action does use a service_role key.
+      if (clientIsServiceRole(client) === false) continue;
+    }
     for (const arg of call.getArguments()) {
       for (const t of tainted as any) {
         if (t.getPos() >= arg.getPos() && t.getEnd() <= arg.getEnd()) {
@@ -292,11 +340,168 @@ function classify(node: any, repoPath: string): Verdict {
 
   // Only a guard that runs *before* the sink counts. Error handling after the
   // query is not authorization.
+  let guarded = !!opts.preGuarded;
   for (const call of node.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    if (guarded) break;
     if (call.getPos() >= sinkPos) continue;
-    if (isGuardCall(call, 0, new Set())) return "guard_before_sink";
+    if (isGuardCall(call, 0, new Set())) guarded = true;
   }
-  return "flagged";
+  if (!guarded) return "flagged";
+
+  // A role check on user_metadata is not authorization: users can rewrite their
+  // own user_metadata with supabase.auth.updateUser({ data: { ... } }).
+  for (const cond of node.getDescendants()) {
+    if (cond.getPos() >= sinkPos) break;
+    const test =
+      Node.isIfStatement(cond) ? cond.getExpression() :
+      Node.isConditionalExpression(cond) ? cond.getCondition() : undefined;
+    if (test && /\buser_metadata\b/.test(test.getText())) return "weak_guard";
+  }
+  return "guard_before_sink";
+}
+
+
+// --- Wrapped actions ---------------------------------------------------------
+// `export const a = client.schema(s).action(async ({ parsedInput, ctx }) => ...)`
+// (next-safe-action) or `export const a = withAuth(async (id) => ...)`. The body
+// is the last function argument of the outermost call.
+function unwrapAction(init: any): { body: any; safeAction: boolean } | undefined {
+  if (!Node.isCallExpression(init)) return undefined;
+  const args = init.getArguments();
+  const fn = [...args].reverse().find((a: any) => Node.isArrowFunction(a) || Node.isFunctionExpression(a));
+  if (!fn) {
+    const inner = [...args].reverse().find((a: any) => Node.isCallExpression(a));
+    return inner ? unwrapAction(inner) : undefined;
+  }
+  const e = init.getExpression();
+  const safeAction = Node.isPropertyAccessExpression(e) && ["action", "stateAction"].includes(e.getName());
+  return { body: fn, safeAction };
+}
+
+const AUTH_ERROR = /unauthori[sz]ed|unauthenticated|forbidden|not (logged|signed) in|not allowed|no session|login required/i;
+
+// A middleware callback (or wrapper body) authenticates if it makes an auth call,
+// or throws an auth error. In `.use(async ({ next }) => { if (!user) throw
+// new Error("Unauthorized"); return next(...) })` the throw is the guard.
+function bodyAuthenticates(fn: any): boolean {
+  if (fn.getDescendantsOfKind(SyntaxKind.CallExpression).some((c: any) => isGuardCall(c, 0, new Set()))) return true;
+  return fn.getDescendantsOfKind(SyntaxKind.ThrowStatement).some((t: any) => AUTH_ERROR.test(t.getText()));
+}
+
+// Walk the call chain that wraps an action body, and the client it starts from
+// (`authActionClient` -> its own `.use(...)` chain), looking for authentication.
+function chainAuthenticates(expr: any, skip: any, depth = 0, seen = new Set<any>()): boolean {
+  let cur = expr;
+  while (cur && depth <= MAX_HELPER_DEPTH && !seen.has(cur)) {
+    seen.add(cur);
+    if (Node.isCallExpression(cur)) {
+      for (const a of cur.getArguments()) {
+        if (a === skip) continue;
+        if ((Node.isArrowFunction(a) || Node.isFunctionExpression(a)) && bodyAuthenticates(a)) return true;
+      }
+      if (!Node.isPropertyAccessExpression(cur.getExpression())) {
+        // Plain wrapper `withAuth(fn)`: does withAuth itself authenticate?
+        const w = localCallee(cur);
+        if (w && bodyAuthenticates(w)) return true;
+      }
+      cur = cur.getExpression();
+    } else if (
+      Node.isPropertyAccessExpression(cur) || Node.isParenthesizedExpression(cur) ||
+      Node.isAwaitExpression(cur) || Node.isNonNullExpression(cur) || Node.isAsExpression(cur)
+    ) {
+      cur = cur.getExpression();
+    } else if (Node.isIdentifier(cur)) {
+      const d = resolveSymbol(cur.getSymbol())?.getDeclarations()?.[0];
+      if (!d || !Node.isVariableDeclaration(d) || !d.getInitializer()) return false;
+      cur = d.getInitializer();
+      depth++;
+    } else {
+      return false;
+    }
+  }
+  return false;
+}
+
+// --- Reachability (Next.js >= 15) --------------------------------------------
+// Since Next.js 15, a Server Action that no client code references is removed
+// from the client bundle and gets no callable ID. An export of a "use server"
+// file that is only imported by route handlers, middleware or other server-only
+// modules is therefore not a public endpoint.
+
+function nextMajor(file: string, repoPath: string): number | undefined {
+  let dir = path.dirname(file);
+  while (dir.startsWith(repoPath)) {
+    const pj = path.join(dir, "package.json");
+    if (fs.existsSync(pj)) {
+      try {
+        const j = JSON.parse(fs.readFileSync(pj, "utf8"));
+        const v = j.dependencies?.next ?? j.devDependencies?.next;
+        if (v) {
+          const m = String(v).match(/(\d+)\./);
+          return m ? Number(m[1]) : undefined;   // "latest", "canary": unknown
+        }
+      } catch { /* unreadable package.json: keep looking */ }
+    }
+    if (dir === repoPath) break;
+    dir = path.dirname(dir);
+  }
+  return undefined;
+}
+
+const isUseServerFile = (sf: any) => {
+  const first = sf.getStatements()[0];
+  return !!first && Node.isExpressionStatement(first) &&
+    /^['"]use server['"];?$/.test(first.getText().trim());
+};
+
+// Importers that cannot hand an action to the browser.
+function isServerOnlyImporter(sf: any): boolean {
+  const fp = sf.getFilePath();
+  if (/\/route\.(t|j)sx?$/.test(fp) || /\/middleware\.(t|j)s$/.test(fp)) return true;
+  if (/\/supabase\/functions\//.test(fp)) return true;
+  if (isUseServerFile(sf)) return true;
+  return sf.getImportDeclarations().some((i: any) => i.getModuleSpecifierValue() === "server-only");
+}
+
+// For each "use server" file: export names some client-capable file imports
+// ("*" = all). A file with no entry here is imported by nobody, or only by
+// server-only modules.
+function exposedExports(project: any): Map<any, Set<string>> {
+  const out = new Map<any, Set<string>>();
+  const mark = (sf: any, name: string) => {
+    if (!out.has(sf)) out.set(sf, new Set());
+    out.get(sf)!.add(name);
+  };
+  for (const sf of project.getSourceFiles()) {
+    const serverOnly = isServerOnlyImporter(sf);
+    for (const decl of [...sf.getImportDeclarations(), ...sf.getExportDeclarations()]) {
+      const target = decl.getModuleSpecifierSourceFile?.();
+      if (!target || !isUseServerFile(target)) continue;
+      // A re-export from a "use server" file exposes it through that file's IDs.
+      const reexport = Node.isExportDeclaration(decl);
+      if (serverOnly && !reexport) continue;
+      if (reexport) {
+        const named = decl.getNamedExports();
+        if (named.length === 0) mark(target, "*");
+        named.forEach((n: any) => mark(target, n.getName()));
+        continue;
+      }
+      if (decl.getNamespaceImport() || decl.getDefaultImport()) mark(target, "*");
+      decl.getNamedImports().forEach((n: any) => mark(target, n.getName()));
+    }
+    // Dynamic import("./actions"): too loose to resolve, so expose everything it might be.
+    if (!serverOnly) {
+      for (const c of sf.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+        if (c.getExpression().getKind() !== SyntaxKind.ImportKeyword) continue;
+        const spec = c.getArguments()[0]?.getText().replace(/['"`]/g, "") ?? "";
+        const base = path.basename(spec);
+        for (const t of project.getSourceFiles()) {
+          if (isUseServerFile(t) && path.basename(t.getFilePath()).replace(/\.(t|j)sx?$/, "") === base) mark(t, "*");
+        }
+      }
+    }
+  }
+  return out;
 }
 
 function scan(repoPath: string): Finding[] {
@@ -315,30 +520,42 @@ function scan(repoPath: string): Finding[] {
   }
 
   const findings: Finding[] = [];
+  let exposed: Map<any, Set<string>> | undefined;
   for (const file of project.getSourceFiles()) {
-    const first = file.getStatements()[0];
-    const isServerFile =
-      !!first &&
-      Node.isExpressionStatement(first) &&
-      /^['"]use server['"];?$/.test(first.getText().trim());
-    if (!isServerFile) continue;
+    if (!isUseServerFile(file)) continue;
 
-    const candidates: [string, any][] = [];
+    const candidates: [string, any, ClassifyOpts][] = [];
     for (const f of file.getFunctions().filter((f) => f.isExported())) {
-      candidates.push([f.getName() ?? "<anonymous>", f]);
+      candidates.push([f.getName() ?? "<anonymous>", f, {}]);
     }
     for (const v of file.getVariableDeclarations().filter((v) => v.isExported())) {
       const init = v.getInitializer();
-      if (init && (Node.isArrowFunction(init) || Node.isFunctionExpression(init))) {
-        candidates.push([v.getName(), init]);
+      if (!init) continue;
+      if (Node.isArrowFunction(init) || Node.isFunctionExpression(init)) {
+        candidates.push([v.getName(), init, {}]);
+        continue;
+      }
+      const w = unwrapAction(init);
+      if (w) {
+        candidates.push([v.getName(), w.body, {
+          safeAction: w.safeAction,
+          preGuarded: chainAuthenticates(init, w.body),
+        }]);
       }
     }
 
-    for (const [name, node] of candidates) {
+    const major = nextMajor(file.getFilePath(), repoPath);
+    for (const [name, node, opts] of candidates) {
       if (FACTORY(name)) continue;
       if (!usesServiceRoleClient(node)) continue;
+      let verdict = classify(node, opts);
+      if ((verdict === "flagged" || verdict === "weak_guard") && major !== undefined && major >= 15) {
+        exposed ??= exposedExports(project);
+        const names = exposed.get(file);
+        if (!names || !(names.has("*") || names.has(name))) verdict = "unreferenced";
+      }
       findings.push({
-        verdict: classify(node, repoPath),
+        verdict,
         file: path.relative(repoPath, file.getFilePath()),
         fn: name,
         line: node.getStartLineNumber(),
@@ -375,13 +592,15 @@ if (!fs.existsSync(repoPath)) {
 }
 
 const findings = scan(repoPath);
-const flagged = findings.filter((f) => f.verdict === "flagged");
+const flagged = findings.filter((f) => f.verdict === "flagged" || f.verdict === "weak_guard");
 
 if (asJson) {
   console.log(JSON.stringify({
     repository: repoPath,
     server_actions_using_service_role: findings.length,
     flagged: flagged.length,
+    weak_guard: findings.filter((f) => f.verdict === "weak_guard").length,
+    unreferenced: findings.filter((f) => f.verdict === "unreferenced").length,
     guard_before_sink: findings.filter((f) => f.verdict === "guard_before_sink").length,
     no_tainted_sink: findings.filter((f) => f.verdict === "no_tainted_sink").length,
     findings,
@@ -392,7 +611,9 @@ if (asJson) {
   } else {
     for (const f of flagged) {
       console.log(`  ${f.file}:${f.line}  ${f.fn}`);
-      console.log(`      argument reaches a service_role query with no guard before it`);
+      console.log(f.verdict === "weak_guard"
+        ? `      guarded by a user_metadata check, which users can rewrite themselves`
+        : `      argument reaches a service_role query with no guard before it`);
     }
     if (showAll) {
       for (const f of findings.filter((x) => x.verdict !== "flagged")) {
