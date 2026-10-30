@@ -41,7 +41,12 @@ import a `service_role` client:
    destructured ones (`{ userId }`) — with one hop of propagation through local variable
    assignments.
 2. Find the first `.eq/.in/.match/.insert/.update/.upsert/.delete` call receiving a tainted
-   node, counting only calls that sit on a `<client>.from(...)` query chain.
+   node, counting only calls that sit on a `<client>.from(...)` query chain whose client
+   traces back to a `service_role` key. The client is followed through variables,
+   reassignments, local factory functions (including `cache(() => ...)` wrappers) and
+   library calls such as `createClient(url, key)`. A query on the user's anon/cookie client
+   is skipped, since RLS applies to it, even if the action reads the service_role key
+   elsewhere. A client that cannot be traced is kept.
 3. Look for a guard call positioned **before** that sink. A guard is a known auth call
    (`.getUser()`, `.getSession()`, `auth()`, `currentUser()`, …), or a function in the
    repository that makes one within three helper levels. Local helpers are judged by what

@@ -87,6 +87,11 @@ function localCallee(call: any): any | undefined {
     if (Node.isVariableDeclaration(d)) {
       const init = d.getInitializer();
       if (init && (Node.isArrowFunction(init) || Node.isFunctionExpression(init))) return init;
+      // Wrapped: `export const getAdmin = cache(() => createClient(...))`
+      if (init && Node.isCallExpression(init)) {
+        const fnArg = init.getArguments().find((a: any) => Node.isArrowFunction(a) || Node.isFunctionExpression(a));
+        if (fnArg) return fnArg;
+      }
     }
   }
   return undefined;
@@ -109,16 +114,17 @@ function isGuardCall(call: any, depth: number, path: Set<any>): boolean {
   return found;
 }
 
-// Does this receiver come from `<client>.from(...)`? Follows one local variable,
-// so `let q = sb.from("t").select(); q = q.eq("id", id)` is still a query.
-function isQueryChain(expr: any): boolean {
+// If this receiver comes from `<client>.from(...)`, return `<client>`. Follows one
+// local variable, so `let q = sb.from("t").select(); q = q.eq("id", id)` is still
+// a query. Returns undefined when it is not a query chain.
+function queryClient(expr: any): any | undefined {
   let cur = expr;
   for (let steps = 0; cur && steps < 50; steps++) {
     if (Node.isCallExpression(cur)) {
       const e = cur.getExpression();
       if (Node.isPropertyAccessExpression(e) && QUERY_ROOT.has(e.getName())) {
         const recv = e.getExpression();
-        if (!(Node.isIdentifier(recv) && recv.getText() === "Array")) return true;
+        if (!(Node.isIdentifier(recv) && recv.getText() === "Array")) return recv;
       }
       cur = e;
     } else if (
@@ -130,13 +136,102 @@ function isQueryChain(expr: any): boolean {
     } else if (Node.isIdentifier(cur)) {
       const d = resolveSymbol(cur.getSymbol())?.getDeclarations()?.[0];
       const init = d && Node.isVariableDeclaration(d) ? d.getInitializer() : undefined;
-      if (!init) return false;
+      if (!init) return undefined;
       cur = init;
     } else {
-      return false;
+      return undefined;
     }
   }
-  return false;
+  return undefined;
+}
+
+const hasServiceKey = (text: string) => SERVICE_KEY.some((p) => text.includes(p));
+
+// Is the client a query runs on a service_role client?
+//   true      — traced to a service_role key
+//   false     — traced to something that is not (an anon/cookie client)
+//   undefined — could not trace it (a class field, a parameter, ...)
+// Checking the whole action for a service_role key is not enough: an action can
+// read the key for one purpose and run its queries on the user's RLS client.
+function clientIsServiceRole(expr: any, depth = 0, seen = new Set<any>()): boolean | undefined {
+  // depth counts function hops only; `seen` stops cycles through variables.
+  if (!expr || depth > MAX_HELPER_DEPTH || seen.has(expr) || seen.size > 200) return undefined;
+  seen.add(expr);
+  let cur = expr;
+  while (
+    Node.isAwaitExpression(cur) || Node.isParenthesizedExpression(cur) ||
+    Node.isNonNullExpression(cur) || Node.isAsExpression(cur)
+  ) cur = cur.getExpression();
+
+  if (hasServiceKey(cur.getText())) return true;
+
+  if (Node.isCallExpression(cur)) {
+    const fn = localCallee(cur);
+    if (fn) return fnReturnsServiceRole(fn, depth + 1, seen);
+    // A library factory, e.g. createClient(url, serviceKey): look at its arguments.
+    const args = cur.getArguments();
+    if (args.length === 0) return undefined;
+    let all: boolean | undefined = false;
+    for (const a of args) {
+      const r = clientIsServiceRole(a, depth, seen);
+      if (r) return true;
+      if (r === undefined) all = undefined;
+    }
+    return all;
+  }
+
+  if (Node.isIdentifier(cur)) {
+    const sym = resolveSymbol(cur.getSymbol());
+    const decls = sym?.getDeclarations() ?? [];
+    let result: boolean | undefined = undefined;
+    for (const d of decls) {
+      if (!Node.isVariableDeclaration(d)) continue;
+      // The declaration and every later reassignment: `let sb = anon(); sb = admin();`
+      const sources: any[] = [];
+      const init = d.getInitializer();
+      if (init) sources.push(init);
+      for (const b of d.getSourceFile().getDescendantsOfKind(SyntaxKind.BinaryExpression)) {
+        if (b.getOperatorToken().getKind() !== SyntaxKind.EqualsToken) continue;
+        const left = b.getLeft();
+        if (Node.isIdentifier(left) &&
+            resolveSymbol(left.getSymbol())?.getDeclarations()?.includes(d)) {
+          sources.push(b.getRight());
+        }
+      }
+      for (const s of sources) {
+        const r = clientIsServiceRole(s, depth, seen);
+        if (r) return true;
+        if (r === false && result === undefined) result = false;
+      }
+    }
+    return result;
+  }
+
+  // Its text was already checked for a service_role key above.
+  if (Node.isStringLiteral(cur) || Node.isNoSubstitutionTemplateLiteral(cur) ||
+      Node.isObjectLiteralExpression(cur)) return false;
+  if (Node.isPropertyAccessExpression(cur) && cur.getText().startsWith("process.env.")) return false;
+  return undefined;
+}
+
+function fnReturnsServiceRole(fn: any, depth: number, seen: Set<any>): boolean | undefined {
+  const body = fn.getBody?.();
+  if (!body) return undefined;
+  if (hasServiceKey(body.getText())) return true;
+  const returned: any[] = Node.isBlock(body)
+    ? body.getDescendantsOfKind(SyntaxKind.ReturnStatement)
+        // Only this function's own returns, not those of callbacks inside it
+        // (`cookies: { get(name) { return ... } }`).
+        .filter((r: any) => r.getParentWhile((n: any) => !Node.isFunctionLikeDeclaration(n))?.getParent() === fn)
+        .map((r: any) => r.getExpression()).filter(Boolean)
+    : [body];
+  let result: boolean | undefined = returned.length ? false : undefined;
+  for (const r of returned) {
+    const v = clientIsServiceRole(r, depth, seen);
+    if (v) return true;
+    if (v === undefined) result = undefined;
+  }
+  return result;
 }
 
 function classify(node: any, repoPath: string): Verdict {
@@ -180,7 +275,11 @@ function classify(node: any, repoPath: string): Verdict {
   for (const call of node.getDescendantsOfKind(SyntaxKind.CallExpression)) {
     const expr = call.getExpression();
     if (!Node.isPropertyAccessExpression(expr) || !SINK.includes(expr.getName())) continue;
-    if (!isQueryChain(expr.getExpression())) continue;
+    const client = queryClient(expr.getExpression());
+    if (!client) continue;
+    // Skip queries traced to a non-privileged client; RLS applies to those.
+    // Untraceable clients stay in, since the action does use a service_role key.
+    if (clientIsServiceRole(client) === false) continue;
     for (const arg of call.getArguments()) {
       for (const t of tainted as any) {
         if (t.getPos() >= arg.getPos() && t.getEnd() <= arg.getEnd()) {

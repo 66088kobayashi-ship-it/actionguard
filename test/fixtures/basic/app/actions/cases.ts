@@ -82,3 +82,26 @@ export async function purgeLogs(orgId: string) {
   await d1();
   await supabaseAdmin.from("logs").delete().eq("org_id", orgId);
 }
+
+import { createUserClient, createAdminClient } from "@/lib/clients";
+
+// N: reads the service_role key for another purpose, queries on the RLS client.
+// Expect: no_tainted_sink
+export async function saveDraft(userId: string, body: string) {
+  if (!process.env.SUPABASE_SERVICE_ROLE_KEY) throw new Error("config");
+  const sb = await createUserClient();
+  await sb.from("drafts").insert({ user_id: userId, body });
+}
+
+// O: starts on the RLS client, reassigned to the admin client. Expect: flagged
+export async function readOrgFlags(orgId: string) {
+  let sb: any = await createUserClient();
+  sb = createAdminClient();
+  return sb.from("orgs").select("flags").eq("id", orgId);
+}
+
+// P: admin client from a cache()-wrapped factory. Expect: flagged
+export async function resetQuota(accountId: string) {
+  const admin = createAdminClient();
+  await admin.from("quotas").update({ used: 0 }).eq("account_id", accountId);
+}

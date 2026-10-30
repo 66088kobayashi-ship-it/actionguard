@@ -11,5 +11,8 @@
   "updateEmail": "flagged",
   "closeAccount": "guard_before_sink",
   "moveTask": "flagged",
-  "purgeLogs": "flagged"
+  "purgeLogs": "flagged",
+  "saveDraft": "no_tainted_sink",
+  "readOrgFlags": "flagged",
+  "resetQuota": "flagged"
 }
