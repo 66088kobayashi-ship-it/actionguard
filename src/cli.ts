@@ -750,12 +750,22 @@ const argv = process.argv.slice(2);
 if (argv.includes("-h") || argv.includes("--help")) {
   console.log(`actionguard <path> [--json] [--all]
 
-  Scans exported Server Actions that use a service_role database client and
-  reports ones where a caller-supplied argument reaches a query filter with no
-  guard running first.
+  Scans exported Server Actions that use a Supabase service_role client and
+  reports ones where a caller-supplied value reaches a query (or an Admin API
+  call) with no auth check running first.
+
+  Reported (exit code 1):
+    flagged       no guard before the privileged query
+    weak_guard    guarded by a user_metadata check, which users can rewrite
+  Not reported (exit code 0, listed with --all):
+    unreferenced  Next.js >= 15 and no client code references it
+    ignored       marked // actionguard-ignore: <reason>
 
   --json   machine-readable output
   --all    also list actions that passed
+
+  Measured precision on unseen repositories is about one in three.
+  Read each finding before acting on it.
 `);
   process.exit(0);
 }

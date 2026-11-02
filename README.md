@@ -7,8 +7,10 @@ Static analysis for Next.js Server Actions: does a caller-supplied identifier re
 npx actionguard <path-to-repo>
 ```
 
-This is an early, noisy MVP. The interesting part is not the tool — it is what happened
-when I ran it across 259 public repositories. Numbers and limitations below.
+Measured precision on repositories it was never tuned on: **28% (7/25) and 44% (4/9)**.
+Roughly one finding in three is a real authorization hole; the rest are mostly endpoints
+that are public on purpose. Every finding is a candidate to read, not a verdict. How
+those numbers were measured is [below](#measured-precision).
 
 ---
 
@@ -96,8 +98,50 @@ and in `--json`, so suppressions stay reviewable.
 
 `npm test` runs the scanner against `test/fixtures/` and checks each verdict.
 
-> The study below was run with v0.1.0, which matched guards by name prefix only and did not
-> follow helpers or destructured parameters. It is being re-measured with the rules above.
+## Measured precision
+
+Each rule change in this tool was made while looking at real findings, so precision measured
+on those same repositories says little. The numbers here come from repositories collected
+*after* the scanner version was frozen, with no overlap with anything used to tune it.
+
+| | Held-out set 1 | Held-out set 2 |
+|---|---|---|
+| Scanner version | `79a0e17` | `ec8621a` |
+| Repositories (Supabase + `"use server"`) | 216 | 105 |
+| Server Actions using a service_role client | 409 | 129 |
+| Reported | 92 in 22 repos | 9 in 6 repos |
+| Hand-checked | 25 (random, ≤2 per repo) | all 9 |
+| Real authorization holes | 7 | 4 |
+| **Precision** | **28%** (95% CI 14–48%) | **44%** (95% CI 19–73%) |
+
+Repositories came from GitHub repository search (Supabase + Next.js, TypeScript, several
+queries and sort orders), shallow-cloned, filtered to projects depending on
+`@supabase/supabase-js` with at least one `"use server"` file. Findings were judged by reading
+the code only; nothing was run against a deployment.
+
+**What the false positives were** (set 1, 18 of 25):
+
+- 9 — public on purpose: anonymous ratings and view counters, public catalogues, lookups by a
+  secret or signed token, sign-up. The syntax does not say "this is meant to be public"; mark
+  these with `// actionguard-ignore: <reason>`.
+- 6 — a guard the scanner missed (auth four helpers deep, `cache(fn)` wrappers, hand-written
+  checks that throw). Fixed in `ec8621a`.
+- 3 — actions no client code can reach on Next.js ≥ 15. Fixed in `ec8621a`.
+
+In set 2 all 5 false positives were public on purpose (sign-up ×3, a contact form, a public
+profile). Do not suppress sign-up actions wholesale: one of the real findings in set 2 was a
+sign-up action that reset the password of *any* existing account.
+
+**What the real findings were:** admin actions protected only by path-based middleware;
+member and payment management with no session check at all; a bulk export of survey responses
+for any campaign ID; report and task reads across workspaces; an account takeover through
+sign-up. All were reported privately to the maintainers. Repositories are not named here.
+
+The precision interval is wide because the samples are small. Treat it as "about a third",
+not as a precise rate.
+
+> Everything below this point is the original study, run with v0.1.0 (guards matched by name
+> prefix only, no helper or destructuring support). Kept for the record.
 
 ## The corpus
 
@@ -201,10 +245,11 @@ per-repository distribution, with repository names replaced by salted hashes.
 
 ## Where this goes
 
-Restricting sinks to writes (`update`/`delete`/`upsert`) and requiring the filtered column
-to look like a subject identifier (`user_id`, `owner_id`, `account_id`) should remove the
-public-read class while keeping the real findings. I have not built that yet, and I am not
-going to claim a false positive rate for it in advance.
+The remaining false positives are endpoints that are public by design. Telling those apart
+from real holes needs intent the code does not carry, so the plan is to keep the scanner
+honest about that (`actionguard-ignore` with a reason) rather than guess. Recall has not been
+measured: the scanner only sees Supabase service_role queries, and misses authorization bugs
+that go through RLS or other databases entirely.
 
 If catching write-side IDOR in Next.js Server Actions in CI is something you'd use, the
 waitlist is here: [https://tally.so/r/1ALZkb]

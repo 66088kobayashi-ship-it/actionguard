@@ -1,12 +1,47 @@
 {
   "name": "actionguard",
-  "version": "0.1.0",
-  "description": "Static analysis for Next.js Server Actions: finds caller-supplied identifiers reaching privileged database queries without a guard",
+  "version": "0.2.0",
+  "description": "Static analysis for Next.js Server Actions: finds caller-supplied values reaching Supabase service_role queries with no auth check first",
   "license": "MIT",
-  "bin": { "actionguard": "./dist/cli.js" },
-  "files": ["dist"],
-  "scripts": { "build": "tsc", "test": "npm run build && node test/run.mjs", "prepublishOnly": "npm test" },
-  "keywords": ["nextjs", "server-actions", "static-analysis", "security", "supabase", "idor"],
-  "dependencies": { "ts-morph": "^21.0.1" },
-  "devDependencies": { "typescript": "^5.4.0", "@types/node": "^20.11.0" }
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/66088kobayashi-ship-it/actionguard.git"
+  },
+  "homepage": "https://github.com/66088kobayashi-ship-it/actionguard#readme",
+  "bugs": {
+    "url": "https://github.com/66088kobayashi-ship-it/actionguard/issues"
+  },
+  "bin": {
+    "actionguard": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node test/run.mjs",
+    "prepublishOnly": "npm test"
+  },
+  "keywords": [
+    "nextjs",
+    "server-actions",
+    "static-analysis",
+    "security",
+    "supabase",
+    "idor",
+    "authorization",
+    "sast"
+  ],
+  "dependencies": {
+    "ts-morph": "^21.0.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.11.0"
+  }
 }
