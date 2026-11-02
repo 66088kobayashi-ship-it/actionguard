@@ -4,7 +4,7 @@ Static analysis for Next.js Server Actions: does a caller-supplied identifier re
 `service_role` database query without passing a guard?
 
 ```bash
-npx actionguard <path-to-repo>
+npx @kobahiro/actionguard <path-to-repo>
 ```
 
 Measured precision on repositories it was never tuned on: **28% (7/25) and 44% (4/9)**.

@@ -1,5 +1,5 @@
 {
-  "name": "actionguard",
+  "name": "@kobahiro/actionguard",
   "version": "0.2.0",
   "description": "Static analysis for Next.js Server Actions: finds caller-supplied values reaching Supabase service_role queries with no auth check first",
   "license": "MIT",
@@ -43,5 +43,8 @@
   "devDependencies": {
     "typescript": "^5.4.0",
     "@types/node": "^20.11.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
