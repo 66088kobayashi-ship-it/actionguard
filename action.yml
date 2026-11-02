@@ -1,4 +1,4 @@
-name: ActionGuard
+name: ActionGuard for Next.js Server Actions
 description: Find Next.js Server Actions where a caller-supplied value reaches a Supabase service_role query with no auth check
 author: kobahiro
 branding:
