@@ -160,6 +160,14 @@ sign-up. All were reported privately to the maintainers. Repositories are not na
 The precision interval is wide because the samples are small. Treat it as "about a third",
 not as a precise rate.
 
+**Misses.** In a third fresh set (223 repositories, scanner `ec8621a`/v0.2.0), I hand-read 30
+actions it had passed, chosen at random (one per repository; 15 guarded, 10 with no tainted
+sink, 5 unreferenced). None was a hole it should have reported: 0/30, so the miss rate among
+the actions it analyzes is below about 10% (95% upper bound). This says nothing about
+authorization bugs outside its scope: databases other than Supabase, RLS policies, a
+service_role client reached through an object property, or admin actions that take no
+arguments at all.
+
 > Everything below this point is the original study, run with v0.1.0 (guards matched by name
 > prefix only, no helper or destructuring support). Kept for the record.
 
