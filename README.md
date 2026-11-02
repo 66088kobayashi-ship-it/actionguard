@@ -1,5 +1,9 @@
 # actionguard
 
+[![npm](https://img.shields.io/npm/v/@kobahiro/actionguard)](https://www.npmjs.com/package/@kobahiro/actionguard)
+[![self-test](https://github.com/66088kobayashi-ship-it/actionguard/actions/workflows/self-test.yml/badge.svg)](https://github.com/66088kobayashi-ship-it/actionguard/actions/workflows/self-test.yml)
+[![license](https://img.shields.io/github/license/66088kobayashi-ship-it/actionguard)](LICENSE)
+
 Static analysis for Next.js Server Actions: does a caller-supplied identifier reach a
 `service_role` database query without passing a guard?
 
