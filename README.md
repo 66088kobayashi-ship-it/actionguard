@@ -20,7 +20,7 @@ jobs:
   actionguard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: 66088kobayashi-ship-it/actionguard@v0.3.0
         # with:
         #   path: apps/web              # where the Next.js app lives
