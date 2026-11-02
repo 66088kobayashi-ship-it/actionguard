@@ -761,8 +761,9 @@ if (argv.includes("-h") || argv.includes("--help")) {
     unreferenced  Next.js >= 15 and no client code references it
     ignored       marked // actionguard-ignore: <reason>
 
-  --json   machine-readable output
-  --all    also list actions that passed
+  --json    machine-readable output
+  --all     also list actions that passed
+  --github  GitHub Actions: line annotations, job summary, \`findings\` output
 
   Measured precision on unseen repositories is about one in three.
   Read each finding before acting on it.
@@ -806,7 +807,7 @@ if (asJson) {
         : `      argument reaches a service_role query with no guard before it`);
     }
     if (showAll) {
-      for (const f of findings.filter((x) => x.verdict !== "flagged")) {
+      for (const f of findings.filter((x) => x.verdict !== "flagged" && x.verdict !== "weak_guard")) {
         console.log(`  ok  ${f.file}:${f.line}  ${f.fn}  (${f.verdict}${f.reason ? `: ${f.reason}` : ""})`);
       }
     }
@@ -822,6 +823,44 @@ if (asJson) {
         "Read each one before acting on it."
       );
     }
+  }
+}
+
+// --- GitHub Actions --------------------------------------------------------
+// --github: annotate each reported action on its line, write a table to the
+// job summary, and set the `findings` output. Annotations are warnings, not
+// errors: measured precision is about one in three, so each one is a
+// candidate to read.
+if (argv.includes("--github")) {
+  const ws = process.env.GITHUB_WORKSPACE || process.cwd();
+  const rel = (f: Finding) => path.relative(ws, path.join(repoPath, f.file)).split(path.sep).join("/");
+  const esc = (s: string) => s.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+  const escProp = (s: string) => esc(s).replace(/:/g, "%3A").replace(/,/g, "%2C");
+  const message = (f: Finding) => f.verdict === "weak_guard"
+    ? `${f.fn}: the admin check reads user_metadata, which users can change themselves. Read the role from app_metadata or a protected table.`
+    : `${f.fn}: a caller-supplied value reaches a service_role query with no auth check before it. Server Actions are public POST endpoints. Add a session/role check, or mark it // actionguard-ignore: <reason> if it is public on purpose.`;
+  for (const f of flagged) {
+    console.log(`::warning file=${escProp(rel(f))},line=${f.line},title=${escProp("ActionGuard: " + f.verdict)}::${esc(message(f))}`);
+  }
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  if (summaryPath) {
+    const cell = (s: string) => s.replace(/\|/g, "\\|");
+    const lines = [
+      "## ActionGuard",
+      "",
+      `${findings.length} Server Actions using a service_role client, **${flagged.length} reported**.`,
+      "",
+    ];
+    if (flagged.length) {
+      lines.push("| Action | File | Verdict |", "|---|---|---|");
+      for (const f of flagged) lines.push(`| \`${cell(f.fn)}\` | \`${cell(rel(f))}:${f.line}\` | ${f.verdict} |`);
+      lines.push("", "These are candidates, not confirmed vulnerabilities. Read each one before acting on it.");
+    }
+    try { fs.appendFileSync(summaryPath, lines.join("\n") + "\n"); } catch { /* summary is optional */ }
+  }
+  const outPath = process.env.GITHUB_OUTPUT;
+  if (outPath) {
+    try { fs.appendFileSync(outPath, `findings=${flagged.length}\n`); } catch { /* output is optional */ }
   }
 }
 

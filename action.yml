@@ -1,0 +1,55 @@
+name: ActionGuard
+description: Find Next.js Server Actions where a caller-supplied value reaches a Supabase service_role query with no auth check
+author: kobahiro
+branding:
+  icon: shield
+  color: red
+
+inputs:
+  path:
+    description: Path of the Next.js project to scan, relative to the repository root
+    default: "."
+  version:
+    description: '@kobahiro/actionguard version to run from npm, or "local" to build this checkout'
+    default: "0.3.0"
+  fail-on-findings:
+    description: Fail the job when anything is reported ("true" or "false")
+    default: "true"
+
+outputs:
+  findings:
+    description: Number of reported Server Actions
+    value: ${{ steps.scan.outputs.findings }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 20
+
+    - if: inputs.version == 'local'
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: npm ci && npm run build
+
+    - id: scan
+      shell: bash
+      env:
+        AG_PATH: ${{ inputs.path }}
+        AG_VERSION: ${{ inputs.version }}
+        AG_FAIL: ${{ inputs.fail-on-findings }}
+        AG_ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set +e
+        if [ "$AG_VERSION" = "local" ]; then
+          node "$AG_ACTION_PATH/dist/cli.js" "$AG_PATH" --github
+        else
+          npx --yes "@kobahiro/actionguard@$AG_VERSION" "$AG_PATH" --github
+        fi
+        code=$?
+        set -e
+        # 1 = something reported, anything above = the scanner itself failed
+        if [ "$code" -gt 1 ]; then exit "$code"; fi
+        if [ "$code" -eq 1 ] && [ "$AG_FAIL" = "true" ]; then exit 1; fi
+        exit 0

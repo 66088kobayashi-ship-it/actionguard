@@ -7,6 +7,26 @@ Static analysis for Next.js Server Actions: does a caller-supplied identifier re
 npx @kobahiro/actionguard <path-to-repo>
 ```
 
+Or in CI, on every push and pull request. Reported actions show up as warnings on their
+lines in the pull request, with a table in the job summary:
+
+```yaml
+# .github/workflows/actionguard.yml
+name: ActionGuard
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  actionguard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: 66088kobayashi-ship-it/actionguard@v0.3.0
+        # with:
+        #   path: apps/web              # where the Next.js app lives
+        #   fail-on-findings: "false"   # report without failing the job
+```
+
 Measured precision on repositories it was never tuned on: **28% (7/25) and 44% (4/9)**.
 Roughly one finding in three is a real authorization hole; the rest are mostly endpoints
 that are public on purpose. Every finding is a candidate to read, not a verdict. How
