@@ -1,0 +1,11 @@
+{
+  "submitContact": "public_write",
+  "joinWaitlist": "flagged",
+  "sendMessage": "flagged",
+  "createProduct": "flagged",
+  "submitFeedbackRow": "flagged",
+  "confirmByToken": "no_tainted_sink",
+  "confirmById": "flagged",
+  "deleteListing": "guard_before_sink",
+  "hideListing": "flagged"
+}

@@ -55,7 +55,8 @@ const FACTORY = (n: string) =>
 // secret. Measured on 30 hand-checked false positives (2026-11).
 const SECRET_COL = /(token|secret|access_?key|otp|nonce|hash)/i;
 
-// Columns that decide who owns a row or what it may do. An insert whose
+// Columns that decide who owns a row or what it may do (plus any column ending
+// in "id": a reference to another row, chosen by the caller). An insert whose
 // caller-supplied values land only in other columns (a contact form, a waitlist
 // entry, a feedback note) cannot touch anyone else's data, so it is reported
 // separately as "public_write" instead of "flagged".
@@ -66,6 +67,31 @@ const PRIV_KEYS = new Set([
   "plan", "plantype", "tier", "credit", "credits", "balance", "verified", "isverified",
   "approved", "isapproved", "status",
 ]);
+// ...and only into tables that hold submissions from the public. An insert into
+// products, payments or gift cards with no auth check is still an unauthorized
+// write, however harmless its columns look.
+const PUBLIC_TABLE = /(contact|feedback|waitlist|wait_list|lead|inquir|enquir|message|report|subscriber|newsletter|suggestion|review|comment|vote|rating|page_?view|click|analytics|survey|signup|registration|rsvp|guestbook|testimonial)/i;
+
+// The table a query chain starts from: `<client>.from("table")...`.
+function queryTable(expr: any): string | undefined {
+  let cur = expr;
+  for (let steps = 0; cur && steps < 50; steps++) {
+    if (Node.isCallExpression(cur)) {
+      const e = cur.getExpression();
+      if (Node.isPropertyAccessExpression(e) && QUERY_ROOT.has(e.getName())) {
+        const a = cur.getArguments()[0];
+        return a && (Node.isStringLiteral(a) || Node.isNoSubstitutionTemplateLiteral(a)) ? a.getLiteralText() : undefined;
+      }
+      cur = e;
+    } else if (Node.isPropertyAccessExpression(cur) || Node.isAwaitExpression(cur) ||
+               Node.isParenthesizedExpression(cur) || Node.isNonNullExpression(cur)) {
+      cur = cur.getExpression();
+    } else {
+      return undefined;
+    }
+  }
+  return undefined;
+}
 
 // A hand-rolled session counts as authentication when the helper both reads the
 // request (cookies()/headers()) and verifies what it read (HMAC, hash compare,
@@ -373,9 +399,16 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
   // Taint set by symbol identity, not by name substring. Matching on names makes
   // a parameter called `id` match every occurrence of "id" in the file.
   const ids = node.getDescendantsOfKind(SyntaxKind.Identifier);
+  // In `{ name, price }` the identifier's own symbol is the property; the value
+  // it reads is the shorthand's value symbol.
+  const symOf = (i: any) => {
+    const par = i.getParent();
+    if (Node.isShorthandPropertyAssignment(par) && par.getNameNode() === i) return par.getValueSymbol();
+    return i.getSymbol();
+  };
   const refsOf = (decl: any) =>
     ids.filter((i) =>
-      (resolveSymbol(i.getSymbol())?.getDeclarations() ?? []).some((x: any) => x === decl)
+      (resolveSymbol(symOf(i))?.getDeclarations() ?? []).some((x: any) => x === decl)
     );
 
   // Destructured parameters (`{ userId }`) declare their names on binding
@@ -451,8 +484,12 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
       for (const t of tainted as any) {
         if (!(t.getPos() >= arg.getPos() && t.getEnd() <= arg.getEnd())) continue;
         if (!isAdminApi && method === "insert") {
+          const table = queryTable(recv);
           const col = insertColumn(t, arg);
-          if (col !== undefined && !PRIV_KEYS.has(col)) { contentInsert = true; continue; }
+          if (table && PUBLIC_TABLE.test(table) && col !== undefined && !PRIV_KEYS.has(col) && !/id$/.test(col)) {
+            contentInsert = true;
+            continue;
+          }
         }
         sinkPos = Math.min(sinkPos, call.getPos());
       }
