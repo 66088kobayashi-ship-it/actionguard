@@ -50,10 +50,36 @@ const GUARD_DEPTH = 6;
 const FACTORY = (n: string) =>
   /create.*client/i.test(n) || /get.*client/i.test(n) || n.toLowerCase().includes("supabase");
 
+// A filter on a secret column is a capability check, not an identity lookup:
+// `.eq("token_hash", hash(token))` only matches if the caller already holds the
+// secret. Measured on 30 hand-checked false positives (2026-11).
+const SECRET_COL = /(token|secret|access_?key|otp|nonce|hash)/i;
+
+// Columns that decide who owns a row or what it may do. An insert whose
+// caller-supplied values land only in other columns (a contact form, a waitlist
+// entry, a feedback note) cannot touch anyone else's data, so it is reported
+// separately as "public_write" instead of "flagged".
+const PRIV_KEYS = new Set([
+  "id", "role", "roles", "admin", "isadmin", "owner", "ownerid", "userid", "user",
+  "tenant", "tenantid", "org", "orgid", "organizationid", "accountid", "workspaceid",
+  "teamid", "memberid", "profileid", "createdby", "permission", "permissions",
+  "plan", "plantype", "tier", "credit", "credits", "balance", "verified", "isverified",
+  "approved", "isapproved", "status",
+]);
+
+// A hand-rolled session counts as authentication when the helper both reads the
+// request (cookies()/headers()) and verifies what it read (HMAC, hash compare,
+// JWT). Reading a cookie alone does not count: presence of a cookie is forgeable.
+const VERIFY_FN = new Set([
+  "createHmac", "createHash", "timingSafeEqual", "jwtVerify", "verify",
+  "unsealData", "getIronSession", "compare", "compareSync", "decrypt",
+]);
+
 type Verdict =
   | "flagged"            // tainted value reaches a service_role sink, no guard before it
   | "weak_guard"         // guarded, but the decision reads user_metadata (user-editable)
   | "unreferenced"       // would be flagged, but Next >= 15 does not expose it (see README)
+  | "public_write"       // caller-supplied values only land in content columns of an insert
   | "ignored"            // would be reported, but marked `// actionguard-ignore: <reason>`
   | "guard_before_sink"
   | "no_tainted_sink";
@@ -155,10 +181,48 @@ function isGuardCall(call: any, depth: number, path: Set<any>): boolean {
   if (!fn) return GUARD_NAME.test(name);
   if (depth >= GUARD_DEPTH || path.has(fn)) return false;
   path.add(fn);
-  const found = throwsAuthError(fn) || fn.getDescendantsOfKind(SyntaxKind.CallExpression)
+  const found = throwsAuthError(fn) || verifiesSession(fn) || fn.getDescendantsOfKind(SyntaxKind.CallExpression)
     .some((c: any) => isGuardCall(c, depth + 1, path));
   path.delete(fn);
   return found;
+}
+
+// Does this helper (or a local helper it calls) read the request AND verify it?
+function verifiesSession(fn: any): boolean {
+  let reads = false, verifies = false;
+  const visit = (f: any, depth: number, seen: Set<any>) => {
+    if (depth > GUARD_DEPTH || seen.has(f) || (reads && verifies)) return;
+    seen.add(f);
+    for (const c of f.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      const n = calleeName(c);
+      if (n === "cookies" || n === "headers") reads = true;
+      if (VERIFY_FN.has(n)) verifies = true;
+      const inner = localCallee(c);
+      if (inner) visit(inner, depth + 1, seen);
+    }
+  };
+  visit(fn, 0, new Set());
+  return reads && verifies;
+}
+
+// For a tainted node inside an insert argument: the column it lands in, if the
+// value sits under a plain `key: value` property. undefined means "whole row or
+// unknown", which is treated as privileged.
+function insertColumn(t: any, arg: any): string | undefined {
+  let cur = t;
+  while (cur && cur !== arg) {
+    const par = cur.getParent();
+    if (!par) return undefined;
+    if (Node.isPropertyAssignment(par) && par.getInitializer() === cur) {
+      return par.getName().replace(/['"`]/g, "").replace(/_/g, "").toLowerCase();
+    }
+    if (Node.isShorthandPropertyAssignment(par)) {
+      return par.getName().replace(/_/g, "").toLowerCase();
+    }
+    if (Node.isSpreadAssignment(par)) return undefined;
+    cur = par;
+  }
+  return undefined;
 }
 
 // `redirect("/login")`, `redirect("/auth/sign-in?next=...")`
@@ -360,31 +424,41 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
   }
 
   let sinkPos = Infinity;
+  let contentInsert = false;
   for (const call of node.getDescendantsOfKind(SyntaxKind.CallExpression)) {
     const expr = call.getExpression();
     if (!Node.isPropertyAccessExpression(expr)) continue;
     const recv = expr.getExpression();
+    const method = expr.getName();
     const isAdminApi =
-      ADMIN_SINK.has(expr.getName()) &&
+      ADMIN_SINK.has(method) &&
       Node.isPropertyAccessExpression(recv) && recv.getName() === "admin" &&
       /(^|\.)auth$/.test((recv as any).getExpression().getText());
     if (!isAdminApi) {
-      if (!SINK.includes(expr.getName())) continue;
+      if (!SINK.includes(method)) continue;
       const client = queryClient(recv);
       if (!client) continue;
       // Skip queries traced to a non-privileged client; RLS applies to those.
       // Untraceable clients stay in, since the action does use a service_role key.
       if (clientIsServiceRole(client) === false) continue;
     }
-    for (const arg of call.getArguments()) {
+    const args = call.getArguments();
+    // `.eq("token_hash", x)`: the caller must already know the secret.
+    if (!isAdminApi && method === "eq" && args.length >= 2 &&
+        (Node.isStringLiteral(args[0]) || Node.isNoSubstitutionTemplateLiteral(args[0])) &&
+        SECRET_COL.test(args[0].getLiteralText())) continue;
+    for (const arg of args) {
       for (const t of tainted as any) {
-        if (t.getPos() >= arg.getPos() && t.getEnd() <= arg.getEnd()) {
-          sinkPos = Math.min(sinkPos, call.getPos());
+        if (!(t.getPos() >= arg.getPos() && t.getEnd() <= arg.getEnd())) continue;
+        if (!isAdminApi && method === "insert") {
+          const col = insertColumn(t, arg);
+          if (col !== undefined && !PRIV_KEYS.has(col)) { contentInsert = true; continue; }
         }
+        sinkPos = Math.min(sinkPos, call.getPos());
       }
     }
   }
-  if (sinkPos === Infinity) return "no_tainted_sink";
+  if (sinkPos === Infinity) return contentInsert ? "public_write" : "no_tainted_sink";
 
   // Only a guard that runs *before* the sink counts. Error handling after the
   // query is not authorization.
@@ -759,6 +833,7 @@ if (argv.includes("-h") || argv.includes("--help")) {
     weak_guard    guarded by a user_metadata check, which users can rewrite
   Not reported (exit code 0, listed with --all):
     unreferenced  Next.js >= 15 and no client code references it
+    public_write  only inserts caller values into content columns (a form)
     ignored       marked // actionguard-ignore: <reason>
 
   --json    machine-readable output
@@ -791,6 +866,7 @@ if (asJson) {
     flagged: flagged.length,
     weak_guard: findings.filter((f) => f.verdict === "weak_guard").length,
     unreferenced: findings.filter((f) => f.verdict === "unreferenced").length,
+    public_write: findings.filter((f) => f.verdict === "public_write").length,
     ignored: findings.filter((f) => f.verdict === "ignored").length,
     guard_before_sink: findings.filter((f) => f.verdict === "guard_before_sink").length,
     no_tainted_sink: findings.filter((f) => f.verdict === "no_tainted_sink").length,
