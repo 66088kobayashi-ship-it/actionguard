@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: 66088kobayashi-ship-it/actionguard@v0.3.1
+      - uses: 66088kobayashi-ship-it/actionguard@v0.4.0
         # with:
         #   path: apps/web              # where the Next.js app lives
         #   fail-on-findings: "false"   # report without failing the job
