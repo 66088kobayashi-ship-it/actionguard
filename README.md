@@ -94,6 +94,7 @@ only `parsedInput` is treated as caller-supplied.
 | `weak_guard` | guarded, but the check reads `user_metadata`, which users can rewrite with `supabase.auth.updateUser` | 1 |
 | `ignored` | would be reported, but marked `// actionguard-ignore: <reason>` | 0 |
 | `unreferenced` | would be flagged, but on Next.js ≥ 15 no client code references it, so it gets no action ID | 0 |
+| `public_write` | only inserts caller values into content columns of a public-submission table (contact, feedback, waitlist, reports...). Any `*_id`, role, owner or status column keeps it `flagged` | 0 |
 | `guard_before_sink` / `no_tainted_sink` | passed | 0 |
 
 `unreferenced` applies only when the nearest `package.json` pins `next` to 15 or later. An
@@ -171,6 +172,32 @@ the actions it analyzes is below about 10% (95% upper bound). This says nothing 
 authorization bugs outside its scope: databases other than Supabase, RLS policies, a
 service_role client reached through an object property, or admin actions that take no
 arguments at all.
+
+### v0.4.0: rules from a false-positive review (November 2026)
+
+I rescanned 1,037 new repositories from November 3–4 with v0.3.0: 194 had a reported action.
+Each was read by an automated reviewer (Claude, reading the source; the 26 most severe were
+re-read by hand before reporting). 101 repositories had a real hole, 87 had only false
+positives, 6 were unclear. I then hand-classified the false positives in 30 of the 87:
+
+- 16 — public on purpose: sign-up, login, contact forms, waitlists, anonymous reports, checkout.
+- 7 — gated by a secret the caller must already hold (a hashed token, an access key, a share link).
+- 3 — a guard the scanner missed: a signed admin cookie verified with HMAC, an early `return` on
+  a failed check, a session-client RPC that throws.
+- 2 — single-user or demo apps with a fixed user ID. 2 — other.
+
+v0.4.0 adds three rules for the first three groups: `.eq()` on a secret column (`token`,
+`secret`, `access_key`, `otp`, `nonce`, `hash`) is no longer a sink; content-only inserts into
+public-submission tables become `public_write`; a local helper that reads `cookies()`/`headers()`
+**and** verifies them (HMAC, hash compare, JWT) counts as a guard — reading a cookie alone does
+not. It also follows `{ name, price }` shorthand properties, which v0.3.0 missed.
+
+Rerun on the same 194 repositories: all 101 real ones are still reported (no repository lost;
+the 29 actions that dropped out of real repositories were token lookups, public submissions
+and actions that do check a signed session). False-positive actions fell from 223 to 151 (−32%) and 12 of the 87
+false-positive repositories are now clean. Precision at repository level moved from about 52% to
+about 56% on this set — real, but small: most remaining false positives are sign-up and login
+actions, which look exactly like the account-takeover sign-ups among the real findings.
 
 > Everything below this point is the original study, run with v0.1.0 (guards matched by name
 > prefix only, no helper or destructuring support). Kept for the record.

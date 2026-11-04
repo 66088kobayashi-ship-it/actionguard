@@ -11,7 +11,7 @@ inputs:
     default: "."
   version:
     description: '@kobahiro/actionguard version to run from npm, or "local" to build this checkout'
-    default: "0.3.0"
+    default: "0.4.0"
   fail-on-findings:
     description: Fail the job when anything is reported ("true" or "false")
     default: "true"
