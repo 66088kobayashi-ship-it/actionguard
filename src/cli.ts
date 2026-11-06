@@ -108,6 +108,7 @@ type Verdict =
   | "weak_guard"         // guarded, but the decision reads user_metadata (user-editable)
   | "unreferenced"       // would be flagged, but Next >= 15 does not expose it (see README)
   | "public_write"       // caller-supplied values only land in content columns of an insert
+  | "env_gated"          // unguarded, but an early process.env check limits where it runs
   | "ignored"            // would be reported, but marked `// actionguard-ignore: <reason>`
   | "guard_before_sink"
   | "no_tainted_sink";
@@ -310,6 +311,8 @@ function verifiesSession(fn: any): boolean {
       const n = calleeName(c);
       if (n === "cookies" || n === "headers") reads = true;
       if (VERIFY_FN.has(n)) verifies = true;
+      // Web Crypto: `crypto.subtle.sign("HMAC", ...)`, `subtle.verify(...)`, `subtle.digest(...)`
+      if (/\bsubtle\.(sign|verify|digest|importKey)\b/.test(c.getExpression().getText())) verifies = true;
       const inner = localCallee(c);
       if (inner) visit(inner, depth + 1, seen);
     }
@@ -597,7 +600,19 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
     guarded = node.getDescendantsOfKind(SyntaxKind.ThrowStatement)
       .some((t: any) => t.getPos() < sinkPos && AUTH_ERROR.test(t.getText()));
   }
-  if (!guarded) return "flagged";
+  if (!guarded) {
+    // `if (process.env.DEMO_MODE !== "true") throw ...` / `if (process.env.VERCEL_ENV === "production") return ...`:
+    // the action only runs where the deployment opts in. Reported separately,
+    // since a misconfigured environment still exposes it.
+    const envGate = node.getDescendantsOfKind(SyntaxKind.IfStatement).some((st: any) => {
+      if (st.getPos() >= sinkPos || !/\bprocess\.env\./.test(st.getExpression().getText())) return false;
+      const then = st.getThenStatement();
+      const stmts = Node.isBlock(then) ? then.getStatements() : [then];
+      const last = stmts[stmts.length - 1];
+      return !!last && (Node.isReturnStatement(last) || Node.isThrowStatement(last));
+    });
+    return envGate ? "env_gated" : "flagged";
+  }
 
   // A role check on user_metadata is not authorization: users can rewrite their
   // own user_metadata with supabase.auth.updateUser({ data: { ... } }).
@@ -951,8 +966,8 @@ const argv = process.argv.slice(2);
 if (argv.includes("-h") || argv.includes("--help")) {
   console.log(`actionguard <path> [--json] [--all]
 
-  Scans exported Server Actions that use a Supabase service_role client and
-  reports ones where a caller-supplied value reaches a query (or an Admin API
+  Scans exported Server Actions that use a Supabase service_role client or a
+  Drizzle client (experimental) and reports ones where a caller-supplied value reaches a query (or an Admin API
   call) with no auth check running first.
 
   Reported (exit code 1):
@@ -961,6 +976,7 @@ if (argv.includes("-h") || argv.includes("--help")) {
   Not reported (exit code 0, listed with --all):
     unreferenced  Next.js >= 15 and no client code references it
     public_write  only inserts caller values into content columns (a form)
+    env_gated     unguarded, but returns early unless an environment variable allows it
     ignored       marked // actionguard-ignore: <reason>
 
   --json    machine-readable output
@@ -994,6 +1010,7 @@ if (asJson) {
     weak_guard: findings.filter((f) => f.verdict === "weak_guard").length,
     unreferenced: findings.filter((f) => f.verdict === "unreferenced").length,
     public_write: findings.filter((f) => f.verdict === "public_write").length,
+    env_gated: findings.filter((f) => f.verdict === "env_gated").length,
     ignored: findings.filter((f) => f.verdict === "ignored").length,
     guard_before_sink: findings.filter((f) => f.verdict === "guard_before_sink").length,
     no_tainted_sink: findings.filter((f) => f.verdict === "no_tainted_sink").length,

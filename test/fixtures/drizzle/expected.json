@@ -3,5 +3,7 @@
   "getNoteById": "flagged",
   "updateNote": "flagged",
   "deleteMyNote": "guard_before_sink",
-  "moveNote": "flagged"
+  "moveNote": "flagged",
+  "archiveNote": "guard_before_sink",
+  "demoResetNote": "env_gated"
 }

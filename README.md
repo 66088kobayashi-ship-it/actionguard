@@ -5,7 +5,8 @@
 [![license](https://img.shields.io/github/license/66088kobayashi-ship-it/actionguard)](LICENSE)
 
 Static analysis for Next.js Server Actions: does a caller-supplied identifier reach a
-`service_role` database query without passing a guard?
+privileged database query — a Supabase `service_role` client or, since v0.5.0, a Drizzle
+client (experimental) — without passing a guard?
 
 ```bash
 npx @kobahiro/actionguard <path-to-repo>
@@ -25,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: 66088kobayashi-ship-it/actionguard@v0.4.0
+      - uses: 66088kobayashi-ship-it/actionguard@v0.5.0
         # with:
         #   path: apps/web              # where the Next.js app lives
         #   fail-on-findings: "false"   # report without failing the job
@@ -94,6 +95,7 @@ only `parsedInput` is treated as caller-supplied.
 | `weak_guard` | guarded, but the check reads `user_metadata`, which users can rewrite with `supabase.auth.updateUser` | 1 |
 | `ignored` | would be reported, but marked `// actionguard-ignore: <reason>` | 0 |
 | `unreferenced` | would be flagged, but on Next.js ≥ 15 no client code references it, so it gets no action ID | 0 |
+| `env_gated` | unguarded, but returns or throws early unless an environment variable allows it (`DEMO_MODE`, `VERCEL_ENV !== "production"`). A misconfigured deployment still exposes it | 0 |
 | `public_write` | only inserts caller values into content columns of a public-submission table (contact, feedback, waitlist, reports...). Any `*_id`, role, owner or status column keeps it `flagged` | 0 |
 | `guard_before_sink` / `no_tainted_sink` | passed | 0 |
 
@@ -201,6 +203,26 @@ actions, which look exactly like the account-takeover sign-ups among the real fi
 
 > Everything below this point is the original study, run with v0.1.0 (guards matched by name
 > prefix only, no helper or destructuring support). Kept for the record.
+
+### Drizzle (experimental, v0.5.0)
+
+A Drizzle client connects with the app's own database credentials, so there is no
+row-level security between a Server Action and the data: every Drizzle query is as
+privileged as a Supabase `service_role` query. v0.5.0 scans Drizzle actions with the same
+taint and guard analysis. Sinks are `.where()`, `.set()`, `.values()`,
+`.onConflictDoUpdate()` and `db.query.<table>.findFirst/findMany({ where })` on chains
+rooted at a `drizzle(...)` client, a lazily built one (`db()`, `getDb()`, a Proxy, `this.db`)
+in a file that imports `drizzle-orm`, or the `tx` of `db.transaction()`. Each finding
+carries `db: "supabase" | "drizzle"`.
+
+Measured on 124 repositories that import `drizzle-orm` from `"use server"` files (GitHub
+code search, November 2026): 78 had a reported action. I hand-read 60 reported actions
+(at most two per repository in the second batch). After two fixes found during that review
+— helpers that return a result object (`if (!guard.ok) return guard`) backed by a
+Web Crypto HMAC session, and early `process.env` exits now reported as `env_gated` —
+35 of the 55 remaining were real (**about 64%**). The rest were mostly public on purpose,
+gated by a secret token, or a single-user local app. Treat it as experimental: the sample
+is small and the shapes of Drizzle code vary more than Supabase's.
 
 ## The corpus
 

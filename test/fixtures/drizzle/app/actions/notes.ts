@@ -38,3 +38,18 @@ export async function localOnly(id: string) {
   m.delete(id);
   return [...m.values()];
 }
+
+import { guardUser } from "@/lib/session";
+
+// Result-object guard backed by a Web Crypto HMAC session. Expect: guard_before_sink
+export async function archiveNote(id: string) {
+  const g = await guardUser();
+  if (!g.ok) return g;
+  await db.update(notes).set({ archived: true }).where(and(eq(notes.id, id), eq(notes.userId, g.userId)));
+}
+
+// Demo-only switch, off unless the environment opts in. Expect: env_gated
+export async function demoResetNote(id: string) {
+  if (process.env.DEMO_MODE !== "true") throw new Error("Demo mode is off");
+  await db.delete(notes).where(eq(notes.id, id));
+}
