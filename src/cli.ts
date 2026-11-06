@@ -29,6 +29,8 @@ const GUARD_MEMBER = new Set([
 ]);
 const AUTH_FN = new Set([
   "currentUser", "auth", "getServerSession", "clerkClient",
+  // Lucia, T3 (NextAuth wrapper), Kinde.
+  "validateRequest", "getServerAuthSession", "getKindeServerSession",
   "getCurrentUser", "getAuthUser", "getSessionUser", "getUser", "getSession",
   // next/navigation: these end the request with 401 / 403.
   "unauthorized", "forbidden",
@@ -123,6 +125,7 @@ interface Finding {
   fn: string;
   line: number;
   reason?: string;   // for "ignored": the text after `actionguard-ignore:`
+  db?: "supabase" | "drizzle";
 }
 
 // `// actionguard-ignore: public view counter, slug is not an identity`
@@ -151,6 +154,90 @@ function usesServiceRoleClient(node: any): boolean {
     for (const d of resolveSymbol(id.getSymbol())?.getDeclarations() ?? []) {
       if (SERVICE_KEY.some((p) => d.getText().includes(p))) return true;
     }
+  }
+  return false;
+}
+
+// ---- Drizzle ------------------------------------------------------------
+// A Drizzle client talks to Postgres with the app's own database credentials:
+// there is no row-level security in between, so every query it runs is as
+// privileged as a Supabase service_role query.
+const DRIZZLE_METHOD = new Set(["select", "insert", "update", "delete", "query"]);
+const DRIZZLE_SINK = new Set(["where", "set", "values", "findFirst", "findMany", "onConflictDoUpdate"]);
+const drizzleCache = new WeakMap<any, boolean>();
+
+// Was this identifier declared as `drizzle(...)` (here or in an imported module),
+// or is it the `tx` of `db.transaction(async (tx) => ...)`?
+function isDrizzleClient(id: any): boolean {
+  for (const d of resolveSymbol(id.getSymbol())?.getDeclarations() ?? []) {
+    if (drizzleCache.has(d)) { if (drizzleCache.get(d)) return true; continue; }
+    let yes = false;
+    if (Node.isVariableDeclaration(d)) {
+      const init = d.getInitializer();
+      yes = !!init && /\bdrizzle\s*\(/.test(init.getText());
+    } else if (Node.isParameterDeclaration(d)) {
+      const fn = d.getParent();
+      const call = fn?.getParent();
+      if (call && Node.isCallExpression(call)) {
+        const e = call.getExpression();
+        yes = Node.isPropertyAccessExpression(e) && e.getName() === "transaction" &&
+          Node.isIdentifier(e.getExpression()) && isDrizzleClient(e.getExpression());
+      }
+    }
+    drizzleCache.set(d, yes);
+    if (yes) return true;
+  }
+  return false;
+}
+
+// The client at the root of a Drizzle query chain:
+// `db.update(t).set(v).where(w)`, `db.query.posts.findFirst({...})`,
+// `getDb().delete(t).where(w)`. Clients are often built lazily (`db()`, a Proxy,
+// `await getDb()`), so a chain counts when its shape is Drizzle's and either the
+// client is traced to `drizzle(...)` or the file imports from "drizzle-orm".
+// Supabase chains start with `.from()`, so they never match this shape.
+function drizzleRoot(expr: any): any | undefined {
+  let cur = expr;
+  for (let steps = 0; cur && steps < 60; steps++) {
+    if (Node.isCallExpression(cur) || Node.isAwaitExpression(cur) ||
+        Node.isParenthesizedExpression(cur) || Node.isNonNullExpression(cur) || Node.isAsExpression(cur)) {
+      cur = cur.getExpression();
+    } else if (Node.isPropertyAccessExpression(cur)) {
+      const recv = cur.getExpression();
+      if (DRIZZLE_METHOD.has(cur.getName()) && isClientExpr(recv)) {
+        if (Node.isIdentifier(recv) && isDrizzleClient(recv)) return recv;
+        return importsDrizzle(recv.getSourceFile()) ? recv : undefined;
+      }
+      cur = recv;
+    } else {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+// `db`, `tx`, `this.db`, `db()`, `getDb()`, `(await getDb())`
+function isClientExpr(e: any): boolean {
+  while (Node.isParenthesizedExpression(e) || Node.isAwaitExpression(e) || Node.isNonNullExpression(e)) e = e.getExpression();
+  if (Node.isIdentifier(e)) return true;
+  if (Node.isPropertyAccessExpression(e)) return e.getExpression().getKind() === SyntaxKind.ThisKeyword || Node.isIdentifier(e.getExpression());
+  if (Node.isCallExpression(e)) return Node.isIdentifier(e.getExpression()) && e.getArguments().length === 0;
+  return false;
+}
+
+const importsDrizzleCache = new WeakMap<any, boolean>();
+function importsDrizzle(sf: any): boolean {
+  if (!importsDrizzleCache.has(sf)) {
+    importsDrizzleCache.set(sf, sf.getImportDeclarations()
+      .some((d: any) => d.getModuleSpecifierValue().startsWith("drizzle-orm")));
+  }
+  return importsDrizzleCache.get(sf)!;
+}
+
+function usesDrizzleClient(node: any): boolean {
+  for (const call of node.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    const e = call.getExpression();
+    if (Node.isPropertyAccessExpression(e) && DRIZZLE_SINK.has(e.getName()) && drizzleRoot(e.getExpression())) return true;
   }
   return false;
 }
@@ -467,7 +554,8 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
       ADMIN_SINK.has(method) &&
       Node.isPropertyAccessExpression(recv) && recv.getName() === "admin" &&
       /(^|\.)auth$/.test((recv as any).getExpression().getText());
-    if (!isAdminApi) {
+    const isDrizzle = !isAdminApi && DRIZZLE_SINK.has(method) && !!drizzleRoot(recv);
+    if (!isAdminApi && !isDrizzle) {
       if (!SINK.includes(method)) continue;
       const client = queryClient(recv);
       if (!client) continue;
@@ -477,13 +565,13 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
     }
     const args = call.getArguments();
     // `.eq("token_hash", x)`: the caller must already know the secret.
-    if (!isAdminApi && method === "eq" && args.length >= 2 &&
+    if (!isAdminApi && !isDrizzle && method === "eq" && args.length >= 2 &&
         (Node.isStringLiteral(args[0]) || Node.isNoSubstitutionTemplateLiteral(args[0])) &&
         SECRET_COL.test(args[0].getLiteralText())) continue;
     for (const arg of args) {
       for (const t of tainted as any) {
         if (!(t.getPos() >= arg.getPos() && t.getEnd() <= arg.getEnd())) continue;
-        if (!isAdminApi && method === "insert") {
+        if (!isAdminApi && !isDrizzle && method === "insert") {
           const table = queryTable(recv);
           const col = insertColumn(t, arg);
           if (table && PUBLIC_TABLE.test(table) && col !== undefined && !PRIV_KEYS.has(col) && !/id$/.test(col)) {
@@ -831,7 +919,8 @@ function scan(repoPath: string): Finding[] {
     const major = nextMajor(file.getFilePath(), repoPath);
     for (const [name, node, opts, stmt] of candidates) {
       if (FACTORY(name)) continue;
-      if (!usesServiceRoleClient(node)) continue;
+      const db = usesServiceRoleClient(node) ? "supabase" : usesDrizzleClient(node) ? "drizzle" : undefined;
+      if (!db) continue;
       let verdict = classify(node, opts);
       if ((verdict === "flagged" || verdict === "weak_guard") && major !== undefined && major >= 15) {
         exposed ??= exposedExports(project);
@@ -848,6 +937,7 @@ function scan(repoPath: string): Finding[] {
         file: path.relative(repoPath, file.getFilePath()),
         fn: name,
         line: node.getStartLineNumber(),
+        db,
         ...(reason ? { reason } : {}),
       });
     }
