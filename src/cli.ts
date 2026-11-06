@@ -963,12 +963,19 @@ function scan(repoPath: string): Finding[] {
 // --- CLI -------------------------------------------------------------------
 
 const argv = process.argv.slice(2);
+// Drizzle has no row-level security, so its queries are as privileged as a
+// service_role query; name the client the finding actually uses.
+const sinkName = (f: Finding) => f.db === "drizzle" ? "Drizzle query (no RLS)" : "service_role query";
+if (argv.includes("--version") || argv.includes("-v")) {
+  console.log(JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8")).version);
+  process.exit(0);
+}
 if (argv.includes("-h") || argv.includes("--help")) {
   console.log(`actionguard <path> [--json] [--all]
 
   Scans exported Server Actions that use a Supabase service_role client or a
-  Drizzle client (experimental) and reports ones where a caller-supplied value reaches a query (or an Admin API
-  call) with no auth check running first.
+  Drizzle client (experimental) and reports ones where a caller-supplied value
+  reaches a query (or an Admin API call) with no auth check running first.
 
   Reported (exit code 1):
     flagged       no guard before the privileged query
@@ -1018,13 +1025,13 @@ if (asJson) {
   }, null, 2));
 } else {
   if (findings.length === 0) {
-    console.log("No Server Actions using a service_role client were found.");
+    console.log("No Server Actions using a service_role or Drizzle client were found.");
   } else {
     for (const f of flagged) {
       console.log(`  ${f.file}:${f.line}  ${f.fn}`);
       console.log(f.verdict === "weak_guard"
         ? `      guarded by a user_metadata check, which users can rewrite themselves`
-        : `      argument reaches a service_role query with no guard before it`);
+        : `      argument reaches a ${sinkName(f)} with no guard before it`);
     }
     if (showAll) {
       for (const f of findings.filter((x) => x.verdict !== "flagged" && x.verdict !== "weak_guard")) {
@@ -1032,7 +1039,7 @@ if (asJson) {
       }
     }
     console.log(
-      `\n${findings.length} Server Actions using service_role, ` +
+      `\n${findings.length} Server Actions using a privileged client, ` +
       `${flagged.length} flagged, ` +
       `${findings.length - flagged.length} passed.`
     );
@@ -1058,7 +1065,7 @@ if (argv.includes("--github")) {
   const escProp = (s: string) => esc(s).replace(/:/g, "%3A").replace(/,/g, "%2C");
   const message = (f: Finding) => f.verdict === "weak_guard"
     ? `${f.fn}: the admin check reads user_metadata, which users can change themselves. Read the role from app_metadata or a protected table.`
-    : `${f.fn}: a caller-supplied value reaches a service_role query with no auth check before it. Server Actions are public POST endpoints. Add a session/role check, or mark it // actionguard-ignore: <reason> if it is public on purpose.`;
+    : `${f.fn}: a caller-supplied value reaches a ${sinkName(f)} with no auth check before it. Server Actions are public POST endpoints. Add a session/role check, or mark it // actionguard-ignore: <reason> if it is public on purpose.`;
   for (const f of flagged) {
     console.log(`::warning file=${escProp(rel(f))},line=${f.line},title=${escProp("ActionGuard: " + f.verdict)}::${esc(message(f))}`);
   }
@@ -1068,7 +1075,7 @@ if (argv.includes("--github")) {
     const lines = [
       "## ActionGuard",
       "",
-      `${findings.length} Server Actions using a service_role client, **${flagged.length} reported**.`,
+      `${findings.length} Server Actions using a privileged client (service_role or Drizzle), **${flagged.length} reported**.`,
       "",
     ];
     if (flagged.length) {
