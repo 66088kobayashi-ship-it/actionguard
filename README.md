@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: 66088kobayashi-ship-it/actionguard@v0.5.1
+      - uses: 66088kobayashi-ship-it/actionguard@v0.5.2
         # with:
         #   path: apps/web              # where the Next.js app lives
         #   fail-on-findings: "false"   # report without failing the job
@@ -95,7 +95,7 @@ only `parsedInput` is treated as caller-supplied.
 | `weak_guard` | guarded, but the check reads `user_metadata`, which users can rewrite with `supabase.auth.updateUser` | 1 |
 | `ignored` | would be reported, but marked `// actionguard-ignore: <reason>` | 0 |
 | `unreferenced` | would be flagged, but on Next.js ≥ 15 no client code references it, so it gets no action ID | 0 |
-| `env_gated` | unguarded, but returns or throws early unless an environment variable allows it (`DEMO_MODE`, `VERCEL_ENV !== "production"`). A misconfigured deployment still exposes it | 0 |
+| `env_gated` | unguarded, but returns or throws early unless an opt-in flag allows it (`DEMO_MODE !== "true"`, `!ENABLE_RESET`) or when running in production (`NODE_ENV === "production"`). A check that a setting exists (`!process.env.SUPABASE_SERVICE_ROLE_KEY`) is not a gate and stays `flagged`. A misconfigured deployment still exposes it | 0 |
 | `public_write` | only inserts caller values into content columns of a public-submission table (contact, feedback, waitlist, reports...). Any `*_id`, role, owner or status column keeps it `flagged` | 0 |
 | `guard_before_sink` / `no_tainted_sink` | passed | 0 |
 
@@ -104,7 +104,11 @@ export counts as referenced when a client module imports it (a `"use client"` fi
 module such a file imports, directly or through barrels and `import()`), or when a server
 component passes it on as a value (`<form action={save}>`, a prop) instead of calling it.
 Type-only imports and test files do not count. Only the names actually imported through a
-barrel count, not everything it re-exports. It is still worth fixing: the
+barrel count, not everything it re-exports. The same goes for `import()`: when client code
+destructures it (`import("./m").then(({ a }) => ...)`, `const { a } = await import("./m")`,
+`Promise.all([...])` slots) or only reads properties of the module, only those names count.
+Checked against a next@16.2.0 build: the other exports get a server-side ID that changes every
+build and is never sent to the browser. It is still worth fixing: the
 day a client component imports it, it becomes an endpoint.
 
 Exit code 1 if anything is `flagged` or `weak_guard`, so it drops into CI.

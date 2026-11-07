@@ -7,5 +7,10 @@
   "confirmByToken": "no_tainted_sink",
   "confirmById": "flagged",
   "deleteListing": "guard_before_sink",
-  "hideListing": "flagged"
+  "hideListing": "flagged",
+  "generateResetLink": "flagged",
+  "addSenderDomain": "flagged",
+  "seedDemoUser": "env_gated",
+  "adminPurgeByPin": "guard_before_sink",
+  "purgeIfConfigured": "flagged"
 }

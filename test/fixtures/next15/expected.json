@@ -9,5 +9,8 @@
   "renameUser": "flagged",
   "refundOrder": "flagged",
   "getInvoice": "unreferenced",
-  "purgeCache": "flagged"
+  "purgeCache": "flagged",
+  "pickedAction": "flagged",
+  "leftoverAction": "unreferenced",
+  "slotAction": "flagged"
 }

@@ -387,6 +387,42 @@ function queryClient(expr: any): any | undefined {
 
 const hasServiceKey = (text: string) => SERVICE_KEY.some((p) => text.includes(p));
 
+// Does an `if` condition switch the action off by environment?
+//   process.env.DEMO_MODE !== "true", !process.env.ENABLE_RESET  -> opt-in flag
+//   process.env.NODE_ENV === "production", VERCEL_ENV !== "development" -> off in production
+// A check that a setting exists (`!process.env.SUPABASE_SERVICE_ROLE_KEY`,
+// `!process.env.RESEND_API_KEY`) is not a gate: production has the setting, so
+// the action runs there unguarded.
+const ENV_NAME = /process\.env(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*["'`]([A-Za-z_][A-Za-z0-9_]*)["'`]\s*\])/g;
+const STAGE_ENV = /^(NODE_ENV|VERCEL_ENV|APP_ENV|NEXT_PUBLIC_APP_ENV|NEXT_PUBLIC_VERCEL_ENV|ENVIRONMENT|ENV|STAGE|DEPLOY_ENV)$/;
+const FLAG_ENV = /(DEMO|ENABLE|ALLOW|FEATURE|FLAG|_MODE$|^MODE$|DEBUG|SANDBOX|PLAYGROUND|DEV_|_DEV$|TESTING|SEED|MAINTENANCE)/;
+const CONFIG_ENV = /(KEY|SECRET|TOKEN|PASSWORD|PASS|URL|URI|DSN|HOST|PORT|ENDPOINT|DOMAIN|REGION|BUCKET|EMAIL|_ID$)/;
+const SECRET_ENV = "process\\.env(?:\\.[A-Za-z0-9_]*|\\[\\s*[\"'`][A-Za-z0-9_]*[\"'`]\\s*\\])";
+const SECRET_NAME = /(PASSWORD|PASSCODE|SECRET|TOKEN|PIN|_KEY)\b/i;
+// `x !== process.env.ADMIN_PASSWORD` (either side), not `process.env.X === undefined`.
+function comparesToEnvSecret(cond: string): boolean {
+  const re = new RegExp(`([\\w.$\\]\\)\\[]+)\\s*(?:!==?|===?)\\s*(${SECRET_ENV})|(${SECRET_ENV})\\s*(?:!==?|===?)\\s*([\\w.$\\]\\)\\[\"'\`]+)`, "g");
+  for (const m of cond.matchAll(re)) {
+    const env = m[2] || m[3];
+    const other = (m[1] || m[4] || "").trim();
+    if (!SECRET_NAME.test(env)) continue;
+    if (/^(undefined|null|true|false|["'`].*["'`]|\d+)$/.test(other)) continue;
+    if (other.startsWith("process.env")) continue;
+    return true;
+  }
+  return false;
+}
+function isEnvGate(cond: string): boolean {
+  const names = [...cond.matchAll(ENV_NAME)].map((m) => (m[1] || m[2]).toUpperCase());
+  if (!names.length) return false;
+  if (names.some((n) => STAGE_ENV.test(n))) {
+    // Exits in production (=== "production"), or everywhere but development/test.
+    return /(?<![!=])===?\s*["'`]production["'`]|["'`]production["'`]\s*===?/.test(cond) ||
+      /!==?\s*["'`](development|dev|test|local)["'`]|["'`](development|dev|test|local)["'`]\s*!==?/.test(cond);
+  }
+  return names.some((n) => FLAG_ENV.test(n) && !CONFIG_ENV.test(n));
+}
+
 // Is the client a query runs on a service_role client?
 //   true      — traced to a service_role key
 //   false     — traced to something that is not (an anon/cookie client)
@@ -601,11 +637,23 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
       .some((t: any) => t.getPos() < sinkPos && AUTH_ERROR.test(t.getText()));
   }
   if (!guarded) {
+    // `if (password !== process.env.ADMIN_PASSWORD) return`: the caller must know
+    // a server-side secret. Treated like a token check.
+    guarded = node.getDescendantsOfKind(SyntaxKind.IfStatement).some((st: any) => {
+      if (st.getPos() >= sinkPos || !comparesToEnvSecret(st.getExpression().getText())) return false;
+      const then = st.getThenStatement();
+      const stmts = Node.isBlock(then) ? then.getStatements() : [then];
+      const last = stmts[stmts.length - 1];
+      return !!last && (Node.isReturnStatement(last) || Node.isThrowStatement(last));
+    });
+    if (guarded) return "guard_before_sink";
+  }
+  if (!guarded) {
     // `if (process.env.DEMO_MODE !== "true") throw ...` / `if (process.env.VERCEL_ENV === "production") return ...`:
     // the action only runs where the deployment opts in. Reported separately,
     // since a misconfigured environment still exposes it.
     const envGate = node.getDescendantsOfKind(SyntaxKind.IfStatement).some((st: any) => {
-      if (st.getPos() >= sinkPos || !/\bprocess\.env\./.test(st.getExpression().getText())) return false;
+      if (st.getPos() >= sinkPos || !isEnvGate(st.getExpression().getText())) return false;
       const then = st.getThenStatement();
       const stmts = Node.isBlock(then) ? then.getStatements() : [then];
       const last = stmts[stmts.length - 1];
@@ -884,11 +932,81 @@ function exposedExports(project: any): Map<any, Set<string>> {
           continue;
         }
         const target = resolveSpecifier(project, sf, arg.getLiteralText());
-        if (target) markThrough(target, "*");
+        if (target) markThrough(target, dynamicImportNames(c));
       }
     }
   }
   return out;
+}
+
+// Which exports does a client-side import("...") use? Next >= 15 ships action
+// ids to the browser only for the exports the client code picks out; the
+// others get a fresh unguessable id each build and cannot be called. Checked
+// against a next@16.2.0 build: `import("./m").then(({ a }) => a())` puts only
+// a's id in the client chunks.
+//   import("m").then(({ a, b }) => ...)                 -> [a, b]
+//   const { a } = await import("m")                    -> [a]
+//   const [{ a }, { b }] = await Promise.all([import("m"), import("n")])
+//   const m = await import("m"); m.a()                 -> [a]
+//   anything else (spread, passing the module around)  -> "*"
+function dynamicImportNames(call: any): string[] | "*" {
+  const fromBinding = (b: any): string[] | "*" => {
+    if (!b) return "*";
+    if (Node.isObjectBindingPattern(b)) {
+      const els = b.getElements();
+      if (els.some((e: any) => e.getDotDotDotToken())) return "*";
+      return els.map((e: any) => e.getPropertyNameNode()?.getText() ?? e.getName());
+    }
+    if (Node.isIdentifier(b)) {
+      const refs = b.findReferencesAsNodes().filter((r: any) => r !== b);
+      const names: string[] = [];
+      for (const r of refs) {
+        const p = r.getParent();
+        if (Node.isPropertyAccessExpression(p) && p.getExpression() === r) names.push(p.getName());
+        else return "*";
+      }
+      return names;
+    }
+    return "*";
+  };
+  let node = call;
+  let parent = node.getParent();
+  // import("m").then(({ a }) => ...)
+  if (Node.isPropertyAccessExpression(parent) && parent.getName() === "then") {
+    const thenCall = parent.getParent();
+    const fn = Node.isCallExpression(thenCall) ? thenCall.getArguments()[0] : undefined;
+    if (fn && (Node.isArrowFunction(fn) || Node.isFunctionExpression(fn))) {
+      return fromBinding(fn.getParameters()[0]?.getNameNode());
+    }
+    return "*";
+  }
+  // Promise.all([import("m"), ...]) : remember the slot
+  let slot = -1;
+  if (Node.isArrayLiteralExpression(parent)) {
+    slot = parent.getElements().indexOf(node);
+    const all = parent.getParent();
+    if (!Node.isCallExpression(all) || !/^Promise\.(all|allSettled)$/.test(all.getExpression().getText())) return "*";
+    node = all;
+    parent = node.getParent();
+  }
+  if (Node.isAwaitExpression(parent)) {
+    node = parent;
+    parent = node.getParent();
+  }
+  while (Node.isParenthesizedExpression(parent)) { node = parent; parent = node.getParent(); }
+  // (await import("m")).a
+  if (slot < 0 && Node.isPropertyAccessExpression(parent) && parent.getExpression() === node) return [parent.getName()];
+  if (Node.isVariableDeclaration(parent) && parent.getInitializer() === node) {
+    const name = parent.getNameNode();
+    if (slot < 0) return fromBinding(name);
+    if (Node.isArrayBindingPattern(name)) {
+      const el = name.getElements()[slot];
+      if (!el || Node.isOmittedExpression(el)) return [];
+      if (el.getDotDotDotToken()) return "*";
+      return fromBinding(el.getNameNode());
+    }
+  }
+  return "*";
 }
 
 function scan(repoPath: string): Finding[] {

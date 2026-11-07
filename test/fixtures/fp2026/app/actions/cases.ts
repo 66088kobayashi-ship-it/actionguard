@@ -52,3 +52,35 @@ export async function hideListing(id: string) {
   if (!(await hasAdminCookie())) return { error: "Admin session required" };
   await db.from("listings").update({ hidden: true }).eq("id", id);
 }
+
+// Checks only that the service key is configured, then mints a reset link
+// for any address. Expect: flagged (not env_gated)
+export async function generateResetLink(email: string) {
+  if (!process.env.SUPABASE_SERVICE_ROLE_KEY) return { error: "Missing key" };
+  const { data } = await db.auth.admin.generateLink({ type: "recovery", email });
+  return data;
+}
+
+// Bracket form of a config check. Expect: flagged
+export async function addSenderDomain(domain: string) {
+  if (!process.env["RESEND_API_KEY"]) throw new Error("Resend not configured");
+  await db.from("sender_domains").update({ verified: true }).eq("domain", domain);
+}
+
+// Opt-in flag, off by default. Expect: env_gated
+export async function seedDemoUser(email: string) {
+  if (!process.env.ALLOW_DEMO_SEED) return;
+  await db.auth.admin.deleteUser(email);
+}
+
+// Caller must know a server-side secret. Expect: guard_before_sink
+export async function adminPurgeByPin(pin: string, id: string) {
+  if (pin !== process.env.ADMIN_PIN) return { error: "Wrong PIN" };
+  await db.from("listings").delete().eq("id", id);
+}
+
+// Only checks the secret is set; any caller passes. Expect: flagged
+export async function purgeIfConfigured(id: string) {
+  if (process.env.ADMIN_PASSWORD === undefined) return;
+  await db.from("listings").delete().eq("id", id);
+}

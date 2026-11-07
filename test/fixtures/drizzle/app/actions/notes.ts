@@ -53,3 +53,21 @@ export async function demoResetNote(id: string) {
   if (process.env.DEMO_MODE !== "true") throw new Error("Demo mode is off");
   await db.delete(notes).where(eq(notes.id, id));
 }
+
+// Only checks that the key is configured; production has it. Expect: flagged
+export async function purgeNote(id: string) {
+  if (!process.env.DATABASE_URL) return { error: "Server not configured" };
+  await db.delete(notes).where(eq(notes.id, id));
+}
+
+// Runs only outside production. Expect: env_gated
+export async function devWipeNote(id: string) {
+  if (process.env.NODE_ENV === "production") throw new Error("Dev only");
+  await db.delete(notes).where(eq(notes.id, id));
+}
+
+// Runs only in production — not a gate. Expect: flagged
+export async function prodOnlyDelete(id: string) {
+  if (process.env.NODE_ENV !== "production") return;
+  await db.delete(notes).where(eq(notes.id, id));
+}
