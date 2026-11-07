@@ -2,12 +2,12 @@
 export function Pick({ id }: { id: string }) {
   const go = () => import("@/app/actions/picked").then(({ pickedAction }) => pickedAction(id));
   const pin = async () => {
-    const [{ slotAction }, { purgeCache }] = await Promise.all([
-      import("@/app/actions/picked"),
-      import("@/app/actions/lazy"),
-    ]);
-    await slotAction(id);
-    await purgeCache(id);
+    const { declAction } = await import("@/app/actions/picked");
+    await declAction(id);
   };
-  return <><button onClick={go}>Delete</button><button onClick={pin}>Pin</button></>;
+  const star = async () => {
+    const [{ slotAction }] = await Promise.all([import("@/app/actions/slotted")]);
+    await slotAction(id);
+  };
+  return <><button onClick={go}>Delete</button><button onClick={pin}>Pin</button><button onClick={star}>Star</button></>;
 }

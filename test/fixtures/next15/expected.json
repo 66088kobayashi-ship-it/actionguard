@@ -12,5 +12,7 @@
   "purgeCache": "flagged",
   "pickedAction": "flagged",
   "leftoverAction": "unreferenced",
-  "slotAction": "flagged"
+  "slotAction": "flagged",
+  "declAction": "flagged",
+  "slotLeftover": "flagged"
 }

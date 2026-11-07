@@ -105,10 +105,11 @@ module such a file imports, directly or through barrels and `import()`), or when
 component passes it on as a value (`<form action={save}>`, a prop) instead of calling it.
 Type-only imports and test files do not count. Only the names actually imported through a
 barrel count, not everything it re-exports. The same goes for `import()`: when client code
-destructures it (`import("./m").then(({ a }) => ...)`, `const { a } = await import("./m")`,
-`Promise.all([...])` slots) or only reads properties of the module, only those names count.
-Checked against a next@16.2.0 build: the other exports get a server-side ID that changes every
-build and is never sent to the browser. It is still worth fixing: the
+destructures it directly (`import("./m").then(({ a }) => ...)`, `const { a } = await import("./m")`),
+only those names count. Checked against a next@16.2.0 build: the
+other exports get a server-side ID that changes every build and is never sent to the browser.
+Holding the module in a variable (`const m = await import("./m"); m.a()`) or loading it through
+`Promise.all([import("./m"), ...])` ships every export's ID, so all of them count. It is still worth fixing: the
 day a client component imports it, it becomes an endpoint.
 
 Exit code 1 if anything is `flagged` or `weak_guard`, so it drops into CI.

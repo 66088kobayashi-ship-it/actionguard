@@ -946,8 +946,8 @@ function exposedExports(project: any): Map<any, Set<string>> {
 // a's id in the client chunks.
 //   import("m").then(({ a, b }) => ...)                 -> [a, b]
 //   const { a } = await import("m")                    -> [a]
-//   const [{ a }, { b }] = await Promise.all([import("m"), import("n")])
-//   const m = await import("m"); m.a()                 -> [a]
+//   Promise.all([import("m"), ...])                    -> "*" (namespaces kept whole)
+//   const m = await import("m"); m.a()                 -> "*" (namespace kept whole)
 //   anything else (spread, passing the module around)  -> "*"
 function dynamicImportNames(call: any): string[] | "*" {
   const fromBinding = (b: any): string[] | "*" => {
@@ -957,20 +957,12 @@ function dynamicImportNames(call: any): string[] | "*" {
       if (els.some((e: any) => e.getDotDotDotToken())) return "*";
       return els.map((e: any) => e.getPropertyNameNode()?.getText() ?? e.getName());
     }
-    if (Node.isIdentifier(b)) {
-      const refs = b.findReferencesAsNodes().filter((r: any) => r !== b);
-      const names: string[] = [];
-      for (const r of refs) {
-        const p = r.getParent();
-        if (Node.isPropertyAccessExpression(p) && p.getExpression() === r) names.push(p.getName());
-        else return "*";
-      }
-      return names;
-    }
+    // `const m = await import("m"); m.a()`: the bundler keeps the whole
+    // namespace, so every export's id reaches the browser (checked: next@16.2.0).
     return "*";
   };
-  let node = call;
-  let parent = node.getParent();
+  let node: any = call;
+  let parent: any = node.getParent();
   // import("m").then(({ a }) => ...)
   if (Node.isPropertyAccessExpression(parent) && parent.getName() === "then") {
     const thenCall = parent.getParent();
@@ -980,32 +972,15 @@ function dynamicImportNames(call: any): string[] | "*" {
     }
     return "*";
   }
-  // Promise.all([import("m"), ...]) : remember the slot
-  let slot = -1;
-  if (Node.isArrayLiteralExpression(parent)) {
-    slot = parent.getElements().indexOf(node);
-    const all = parent.getParent();
-    if (!Node.isCallExpression(all) || !/^Promise\.(all|allSettled)$/.test(all.getExpression().getText())) return "*";
-    node = all;
-    parent = node.getParent();
-  }
+  // Promise.all([import("m"), ...]) keeps every namespace whole (checked:
+  // next@16.2.0 ships all ids even when the slot is destructured).
+  if (Node.isArrayLiteralExpression(parent)) return "*";
   if (Node.isAwaitExpression(parent)) {
     node = parent;
     parent = node.getParent();
   }
   while (Node.isParenthesizedExpression(parent)) { node = parent; parent = node.getParent(); }
-  // (await import("m")).a
-  if (slot < 0 && Node.isPropertyAccessExpression(parent) && parent.getExpression() === node) return [parent.getName()];
-  if (Node.isVariableDeclaration(parent) && parent.getInitializer() === node) {
-    const name = parent.getNameNode();
-    if (slot < 0) return fromBinding(name);
-    if (Node.isArrayBindingPattern(name)) {
-      const el = name.getElements()[slot];
-      if (!el || Node.isOmittedExpression(el)) return [];
-      if (el.getDotDotDotToken()) return "*";
-      return fromBinding(el.getNameNode());
-    }
-  }
+  if (Node.isVariableDeclaration(parent) && parent.getInitializer() === node) return fromBinding(parent.getNameNode());
   return "*";
 }
 
