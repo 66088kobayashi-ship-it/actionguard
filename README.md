@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: 66088kobayashi-ship-it/actionguard@v0.6.0
+      - uses: 66088kobayashi-ship-it/actionguard@v0.7.0
         # with:
         #   path: apps/web              # where the Next.js app lives
         #   fail-on-findings: "false"   # report without failing the job
@@ -97,6 +97,7 @@ only `parsedInput` is treated as caller-supplied.
 | `unreferenced` | would be flagged, but on Next.js ≥ 15 no client code references it, so it gets no action ID | 0 |
 | `env_gated` | unguarded, but returns or throws early unless an opt-in flag allows it (`DEMO_MODE !== "true"`, `!ENABLE_RESET`) or when running in production (`NODE_ENV === "production"`). A check that a setting exists (`!process.env.SUPABASE_SERVICE_ROLE_KEY`) is not a gate and stays `flagged`. A misconfigured deployment still exposes it | 0 |
 | `idor_candidate` | **experimental** — a login check runs first, but a caller-supplied value picks the rows (an id-like column, an Admin API target, the owner column of a new row) and neither the query nor any check involves the session user. Listed under "Possible IDOR"; never fails the run | 0 |
+| `no_auth` | flagged, in a repository with no auth library and no auth call anywhere. Still reported (exit 1), but as **one** finding for the repository: the fix is "add authentication", not N separate checks | 1 |
 | `public_write` | only inserts caller values into content columns of a public-submission table (contact, feedback, waitlist, reports...). Any `*_id`, role, owner or status column keeps it `flagged` | 0 |
 | `guard_before_sink` / `no_tainted_sink` | passed | 0 |
 
@@ -256,6 +257,24 @@ had not used while writing the rules: **6 real, 7 false, 5 unclear** (33% counti
 false, 46% without them). The false ones were mostly single-admin CMSs and internal tools
 where every signed-in person is staff, which the source alone cannot tell apart from a
 multi-tenant app. That is why it does not fail the run yet.
+
+### v0.7.0: one finding for apps with no authentication, and two rules that failed
+
+I tallied the reasons behind 1,175 false positives I had labelled by hand. The two biggest
+were "public on purpose" (309: catalog reads, logins, sign-ups, view counters; spread over
+135 repositories) and "single-user, demo, or no auth at all" (276; 54 repositories).
+Helpers the scanner missed were 135, but in only 13 repositories.
+
+I wrote three rules and ran them over the 410 repositories behind those labels (259 with
+labelled false positives, 213 with real findings), before and after:
+
+| Rule | What it did | Result |
+|---|---|---|
+| `public_read`: unguarded reads of non-sensitive tables, no sensitive join or column, no single-row read by key without a published/status filter | removed 97 of 307 "public on purpose" labels | **rejected**: hid real findings, for example `getPrivateWorkspaces` in four repositories, event attendee recipient lists, interview feedback. Private tables have too many names for a blocklist (`workspaces`, `streams`, `enrollments`, `attendance`...) |
+| `auth_flow`: logins ending in a password check, sign-ups where the caller cannot set a role, plan or owner id | removed most login/sign-up labels | **rejected**: hid four functions named in real reports (an admin login, three sign-ups) |
+| `no_auth`: the repository has no auth library and no auth call | grouped 360 functions in 78 repositories into 78 findings | **kept**: nothing stops being reported. Units to review that were labelled false: 1,143 → 905 (−20%); all units to review: 3,217 → 2,935 (−8%) |
+
+The rejected rules are kept as test fixtures that must stay `flagged`.
 
 ## The corpus
 

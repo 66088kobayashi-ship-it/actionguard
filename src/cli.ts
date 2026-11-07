@@ -112,8 +112,6 @@ type Verdict =
   | "ignored"            // would be reported, but marked `// actionguard-ignore: <reason>`
   | "idor_candidate"     // guarded, but a caller-supplied id picks the rows and nothing ties it to the session
   | "no_auth"            // flagged, in an app with no authentication anywhere (reported once per repository)
-  | "public_read"        // unguarded, but only reads non-sensitive tables by non-key columns
-  | "auth_flow"          // unguarded login or sign-up that cannot pick a role or someone else's row
   | "guard_before_sink"
   | "no_tainted_sink";
 
@@ -520,7 +518,7 @@ interface ClassifyOpts {
   safeAction?: boolean;
   // A wrapper or middleware around the body performs authentication.
   preGuarded?: boolean;
-  // The exported name, for login / sign-up recognition.
+  // The exported name (kept for diagnostics).
   name?: string;
 }
 
@@ -668,8 +666,6 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
       return !!last && (Node.isReturnStatement(last) || Node.isThrowStatement(last));
     });
     if (envGate) return "env_gated";
-    if (isPublicRead(node, sinks)) return "public_read";
-    if (isAuthFlow(node, opts.name ?? "", sinks, taintedDecls)) return "auth_flow";
     return "flagged";
   }
 
@@ -688,99 +684,7 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
   return "guard_before_sink";
 }
 
-// --- Public reads and auth flows (v0.7.0) --------------------------------------
-// From the hand-labelled false positives: a quarter were reads of public data
-// (catalog search, a syllabus tree) and logins / sign-ups. Both are recognised
-// narrowly; anything that could leak or escalate stays flagged.
-
-// Tables and columns whose rows belong to someone. Whole words, so `user_id`
-// does not match `user`, but `users`, `profiles(email)` and `with: { user: true }` do.
-const SENSITIVE = /\b(users?|profiles?|accounts?|members?|customers?|clients?|patients?|students?|employees?|staff|orders?|payments?|invoices?|billing|subscriptions?|transactions?|wallets?|messages?|chats?|conversations?|notifications?|sessions?|tokens?|api_?keys?|keys|secrets?|credentials?|passwords?|password_hash|emails?|phones?|phone_number|address(es)?|bookings?|reservations?|appointments?|applications?|submissions?|documents?|files?|notes?|journals?|diar(y|ies)|settings|salar(y|ies)|medical|health|grades?|private|drafts?|audit\w*|leads?|contacts?)\b/i;
-const VISIBILITY = /publish|status|visib|is_?public|isPublic|active|deleted|approved|draft|archived/i;
-
-function stmtOf(n: any): any {
-  return n.getAncestors().find((a: any) => Node.isStatement(a) && !Node.isBlock(a)) ?? n;
-}
-
-function readTables(stmt: any): string[] | undefined {
-  const names: string[] = [];
-  for (const c of stmt.getDescendantsOfKind(SyntaxKind.CallExpression)) {
-    const n = calleeName(c);
-    const a0 = c.getArguments()[0];
-    if (a0 && /^(from|leftJoin|innerJoin|rightJoin|fullJoin)$/.test(n)) {
-      names.push(Node.isStringLiteral(a0) || Node.isNoSubstitutionTemplateLiteral(a0) ? a0.getLiteralText() : lastName(a0.getText()));
-    }
-  }
-  for (const pa of stmt.getDescendantsOfKind(SyntaxKind.PropertyAccessExpression)) {
-    const m = pa.getText().match(/\.query\.(\w+)\.(findFirst|findMany)$/);   // db.query.<table>.findMany
-    if (m) names.push(m[1]);
-  }
-  return names.length ? names : undefined;
-}
-
-function isPublicRead(node: any, sinks: Sink[]): boolean {
-  const text = node.getText();
-  if (WRITE_CALL.test(text) || /\.rpc\s*\(|\.execute\s*\(|\bsql`/.test(text)) return false;
-  if (!sinks.length || sinks.some((sk) => sk.isAdminApi)) return false;
-  for (const sk of sinks) {
-    const stmt = stmtOf(sk.call);
-    const tables = readTables(stmt);
-    if (!tables) return false;                                         // cannot tell what it reads
-    if (tables.some((t) => SENSITIVE.test(t.replace(/([a-z])([A-Z])/g, "$1_$2")))) return false;
-    if (SENSITIVE.test(stmt.getText())) return false;                  // joins, with:, selected columns
-    // One row by its key with no visibility condition could be a draft or a
-    // private row that only its owner should see.
-    if (usedAsKey(sk) && !VISIBILITY.test(stmt.getText())) return false;
-  }
-  return true;
-}
-
-const LOGIN_NAME = /(log_?in|sign_?in|authenticate)/i;
-const SIGNUP_NAME = /(sign_?up|register|join|create_?account|onboard)/i;
-const PASSWORD_CHECK = /\b(compare|compareSync|verify|argon2|bcrypt|scrypt|timingSafeEqual|signInWithPassword|signInWithOtp|signInEmail|signIn)\s*\(/;
-const LOGIN_WRITE_TABLE = /session|token|login|attempt|audit|log|otp|verification/i;
-const SIGNUP_PRIV = new Set(["role", "roles", "admin", "isadmin", "permission", "permissions", "plan", "plantype",
-  "tier", "credit", "credits", "balance", "verified", "isverified", "approved", "isapproved", "status",
-  "appmetadata", "userid", "ownerid", "orgid", "organizationid", "tenantid", "teamid", "workspaceid", "accountid"]);
-
-function isAuthFlow(node: any, name: string, sinks: Sink[], taintedDecls: Set<any>): boolean {
-  const text = node.getText();
-  const writes = node.getDescendantsOfKind(SyntaxKind.CallExpression).filter((c: any) =>
-    /^(insert|update|delete|upsert|deleteUser|updateUserById|generateLink|inviteUserByEmail|createUser)$/.test(calleeName(c)));
-  if (LOGIN_NAME.test(name) && !SIGNUP_NAME.test(name) && PASSWORD_CHECK.test(text)) {
-    // A login may record a session or an attempt; any other write is not a login.
-    return writes.every((c: any) => calleeName(c) === "insert" && LOGIN_WRITE_TABLE.test(stmtOf(c).getText()));
-  }
-  if (!SIGNUP_NAME.test(name)) return false;
-  if (writes.some((c: any) => !/^(insert|createUser)$/.test(calleeName(c)))) return false;
-  if (!writes.length && !/\.(signUp|signUpEmail)\s*\(/.test(text)) return false;
-  if (sinks.some((sk) => sk.isAdminApi && sk.method !== "createUser")) return false;
-  // The caller must not pick a role, a plan, a verified flag or someone else's
-  // id, directly or by spreading their input into the row.
-  const isT = (d: any) => taintedDecls.has(d) ||
-    (Node.isBindingElement(d) && taintedDecls.has(d.getFirstAncestorByKind(SyntaxKind.VariableDeclaration)));
-  const tainted = (n: any) => {
-    if (!n) return false;
-    const ids = Node.isIdentifier(n) ? [n] : n.getDescendantsOfKind(SyntaxKind.Identifier);
-    return ids.some((i: any) => (resolveSymbol(i.getSymbol())?.getDeclarations() ?? []).some(isT));
-  };
-  const calls = writes.concat(node.getDescendantsOfKind(SyntaxKind.CallExpression)
-    .filter((c: any) => /^(signUp|signUpEmail)$/.test(calleeName(c))));
-  for (const c of calls) {
-    for (const arg of c.getArguments()) {
-      if (Node.isIdentifier(arg) && tainted(arg)) return false;                  // insert(input)
-      for (const sp of arg.getDescendantsOfKind(SyntaxKind.SpreadAssignment)) if (tainted(sp.getExpression())) return false;
-      for (const pa of arg.getDescendantsOfKind(SyntaxKind.PropertyAssignment)) {
-        if (SIGNUP_PRIV.has(norm(pa.getName())) && tainted(pa.getInitializer())) return false;
-      }
-      for (const sh of arg.getDescendantsOfKind(SyntaxKind.ShorthandPropertyAssignment)) {
-        if (SIGNUP_PRIV.has(norm(sh.getName())) && (sh.getValueSymbol()?.getDeclarations() ?? []).some(isT)) return false;
-      }
-    }
-  }
-  return true;
-}
-
+// --- Apps with no authentication (v0.7.0) ------------------------------------
 // Does the repository authenticate anyone, anywhere? An app with no auth library
 // and no auth call gets one repository-level finding instead of one per action:
 // the fix is "add authentication", not N separate checks.
@@ -1427,9 +1331,6 @@ if (argv.includes("-h") || argv.includes("--help")) {
     flagged       no guard before the privileged query
     weak_guard    guarded by a user_metadata check, which users can rewrite
     no_auth       the whole app has no authentication; reported once for the repo
-  Not reported (continued):
-    public_read   only reads non-sensitive tables by non-key or published-only filters
-    auth_flow     a login, or a sign-up where the caller cannot choose a role or id
   Experimental (listed, exit code unaffected):
     idor_candidate  logged in is checked, but a caller-supplied id picks the
                     rows and nothing ties it to the session user
@@ -1472,8 +1373,6 @@ if (asJson) {
     weak_guard: findings.filter((f) => f.verdict === "weak_guard").length,
     idor_candidate: idor.length,
     no_auth: noAuth.length,
-    public_read: findings.filter((f) => f.verdict === "public_read").length,
-    auth_flow: findings.filter((f) => f.verdict === "auth_flow").length,
     unreferenced: findings.filter((f) => f.verdict === "unreferenced").length,
     public_write: findings.filter((f) => f.verdict === "public_write").length,
     env_gated: findings.filter((f) => f.verdict === "env_gated").length,

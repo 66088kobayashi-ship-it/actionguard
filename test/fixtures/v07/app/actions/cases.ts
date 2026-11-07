@@ -1,10 +1,13 @@
+// Rules tried in v0.7.0 and rejected: a regression over 410 hand-labelled
+// repositories showed them hiding real findings (see README, v0.7.0).
+// These cases pin the decision: every one stays flagged.
 "use server";
 import { supabaseAdmin } from "@/lib/admin";
 import { db, notes as courses } from "@/lib/db";
 import { eq } from "drizzle-orm";
 import { compare } from "bcryptjs";
 
-// Public catalog filtered by a non-key column. Expect: public_read
+// Public catalog filtered by a non-key column. Expect: flagged (public_read rejected)
 export async function searchProducts(category: string) {
   return supabaseAdmin.from("products").select("id, name, price").eq("category", category);
 }
@@ -14,7 +17,7 @@ export async function getProductById(id: string) {
   return supabaseAdmin.from("products").select("*").eq("id", id).single();
 }
 
-// By id, but only published rows. Expect: public_read
+// By id, but only published rows. Expect: flagged (public_read rejected)
 export async function getPublishedPost(id: string) {
   return supabaseAdmin.from("posts").select("*").eq("id", id).eq("published", true).single();
 }
@@ -29,14 +32,14 @@ export async function getOrdersByStatus(status: string) {
   return supabaseAdmin.from("orders").select("*").eq("status", status);
 }
 
-// Login: reads the user by email and checks the password. Expect: auth_flow
+// Login: reads the user by email and checks the password. Expect: flagged (auth_flow rejected)
 export async function loginAction(email: string, password: string) {
   const { data } = await supabaseAdmin.from("users").select("id, password_hash").eq("email", email).single();
   if (!data || !(await compare(password, data.password_hash))) return { error: "Invalid credentials" };
   return { ok: true };
 }
 
-// Sign-up with no role field. Expect: auth_flow
+// Sign-up with no role field. Expect: flagged (auth_flow rejected)
 export async function signupAction(email: string, name: string) {
   await supabaseAdmin.from("profiles").insert({ email, name });
 }
@@ -56,7 +59,7 @@ export async function joinWithResetLink(email: string) {
   return supabaseAdmin.auth.admin.generateLink({ type: "recovery", email });
 }
 
-// Drizzle public list by a non-key column. Expect: public_read
+// Drizzle public list by a non-key column. Expect: flagged (public_read rejected)
 export async function listCourses(category: string) {
   return db.select().from(courses).where(eq(courses.category, category));
 }
