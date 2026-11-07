@@ -1,0 +1,1 @@
+{ "name": "fixture-idor", "private": true, "dependencies": { "next-auth": "^5.0.0" } }

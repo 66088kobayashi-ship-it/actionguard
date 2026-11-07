@@ -1,0 +1,1 @@
+{ "name": "fixture-v07", "private": true, "dependencies": { "bcryptjs": "^2.4.3" } }

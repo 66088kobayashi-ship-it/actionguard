@@ -1,0 +1,14 @@
+{
+  "searchProducts": "public_read",
+  "getProductById": "flagged",
+  "getPublishedPost": "public_read",
+  "getPostWithAuthor": "flagged",
+  "getOrdersByStatus": "flagged",
+  "loginAction": "auth_flow",
+  "signupAction": "auth_flow",
+  "signupWithRole": "flagged",
+  "registerUser": "flagged",
+  "joinWithResetLink": "flagged",
+  "listCourses": "public_read",
+  "getCourseWithUser": "flagged"
+}

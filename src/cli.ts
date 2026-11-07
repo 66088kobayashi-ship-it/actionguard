@@ -111,6 +111,9 @@ type Verdict =
   | "env_gated"          // unguarded, but an early process.env check limits where it runs
   | "ignored"            // would be reported, but marked `// actionguard-ignore: <reason>`
   | "idor_candidate"     // guarded, but a caller-supplied id picks the rows and nothing ties it to the session
+  | "no_auth"            // flagged, in an app with no authentication anywhere (reported once per repository)
+  | "public_read"        // unguarded, but only reads non-sensitive tables by non-key columns
+  | "auth_flow"          // unguarded login or sign-up that cannot pick a role or someone else's row
   | "guard_before_sink"
   | "no_tainted_sink";
 
@@ -517,6 +520,8 @@ interface ClassifyOpts {
   safeAction?: boolean;
   // A wrapper or middleware around the body performs authentication.
   preGuarded?: boolean;
+  // The exported name, for login / sign-up recognition.
+  name?: string;
 }
 
 function classify(node: any, opts: ClassifyOpts = {}): Verdict {
@@ -662,7 +667,10 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
       const last = stmts[stmts.length - 1];
       return !!last && (Node.isReturnStatement(last) || Node.isThrowStatement(last));
     });
-    return envGate ? "env_gated" : "flagged";
+    if (envGate) return "env_gated";
+    if (isPublicRead(node, sinks)) return "public_read";
+    if (isAuthFlow(node, opts.name ?? "", sinks, taintedDecls)) return "auth_flow";
+    return "flagged";
   }
 
   // A role check on user_metadata is not authorization: users can rewrite their
@@ -678,6 +686,128 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
     if (looksLikeIdor(node, sinks, sinkPos, taintedDecls, opts)) return "idor_candidate";
   }
   return "guard_before_sink";
+}
+
+// --- Public reads and auth flows (v0.7.0) --------------------------------------
+// From the hand-labelled false positives: a quarter were reads of public data
+// (catalog search, a syllabus tree) and logins / sign-ups. Both are recognised
+// narrowly; anything that could leak or escalate stays flagged.
+
+// Tables and columns whose rows belong to someone. Whole words, so `user_id`
+// does not match `user`, but `users`, `profiles(email)` and `with: { user: true }` do.
+const SENSITIVE = /\b(users?|profiles?|accounts?|members?|customers?|clients?|patients?|students?|employees?|staff|orders?|payments?|invoices?|billing|subscriptions?|transactions?|wallets?|messages?|chats?|conversations?|notifications?|sessions?|tokens?|api_?keys?|keys|secrets?|credentials?|passwords?|password_hash|emails?|phones?|phone_number|address(es)?|bookings?|reservations?|appointments?|applications?|submissions?|documents?|files?|notes?|journals?|diar(y|ies)|settings|salar(y|ies)|medical|health|grades?|private|drafts?|audit\w*|leads?|contacts?)\b/i;
+const VISIBILITY = /publish|status|visib|is_?public|isPublic|active|deleted|approved|draft|archived/i;
+
+function stmtOf(n: any): any {
+  return n.getAncestors().find((a: any) => Node.isStatement(a) && !Node.isBlock(a)) ?? n;
+}
+
+function readTables(stmt: any): string[] | undefined {
+  const names: string[] = [];
+  for (const c of stmt.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    const n = calleeName(c);
+    const a0 = c.getArguments()[0];
+    if (a0 && /^(from|leftJoin|innerJoin|rightJoin|fullJoin)$/.test(n)) {
+      names.push(Node.isStringLiteral(a0) || Node.isNoSubstitutionTemplateLiteral(a0) ? a0.getLiteralText() : lastName(a0.getText()));
+    }
+  }
+  for (const pa of stmt.getDescendantsOfKind(SyntaxKind.PropertyAccessExpression)) {
+    const m = pa.getText().match(/\.query\.(\w+)\.(findFirst|findMany)$/);   // db.query.<table>.findMany
+    if (m) names.push(m[1]);
+  }
+  return names.length ? names : undefined;
+}
+
+function isPublicRead(node: any, sinks: Sink[]): boolean {
+  const text = node.getText();
+  if (WRITE_CALL.test(text) || /\.rpc\s*\(|\.execute\s*\(|\bsql`/.test(text)) return false;
+  if (!sinks.length || sinks.some((sk) => sk.isAdminApi)) return false;
+  for (const sk of sinks) {
+    const stmt = stmtOf(sk.call);
+    const tables = readTables(stmt);
+    if (!tables) return false;                                         // cannot tell what it reads
+    if (tables.some((t) => SENSITIVE.test(t.replace(/([a-z])([A-Z])/g, "$1_$2")))) return false;
+    if (SENSITIVE.test(stmt.getText())) return false;                  // joins, with:, selected columns
+    // One row by its key with no visibility condition could be a draft or a
+    // private row that only its owner should see.
+    if (usedAsKey(sk) && !VISIBILITY.test(stmt.getText())) return false;
+  }
+  return true;
+}
+
+const LOGIN_NAME = /(log_?in|sign_?in|authenticate)/i;
+const SIGNUP_NAME = /(sign_?up|register|join|create_?account|onboard)/i;
+const PASSWORD_CHECK = /\b(compare|compareSync|verify|argon2|bcrypt|scrypt|timingSafeEqual|signInWithPassword|signInWithOtp|signInEmail|signIn)\s*\(/;
+const LOGIN_WRITE_TABLE = /session|token|login|attempt|audit|log|otp|verification/i;
+const SIGNUP_PRIV = new Set(["role", "roles", "admin", "isadmin", "permission", "permissions", "plan", "plantype",
+  "tier", "credit", "credits", "balance", "verified", "isverified", "approved", "isapproved", "status",
+  "appmetadata", "userid", "ownerid", "orgid", "organizationid", "tenantid", "teamid", "workspaceid", "accountid"]);
+
+function isAuthFlow(node: any, name: string, sinks: Sink[], taintedDecls: Set<any>): boolean {
+  const text = node.getText();
+  const writes = node.getDescendantsOfKind(SyntaxKind.CallExpression).filter((c: any) =>
+    /^(insert|update|delete|upsert|deleteUser|updateUserById|generateLink|inviteUserByEmail|createUser)$/.test(calleeName(c)));
+  if (LOGIN_NAME.test(name) && !SIGNUP_NAME.test(name) && PASSWORD_CHECK.test(text)) {
+    // A login may record a session or an attempt; any other write is not a login.
+    return writes.every((c: any) => calleeName(c) === "insert" && LOGIN_WRITE_TABLE.test(stmtOf(c).getText()));
+  }
+  if (!SIGNUP_NAME.test(name)) return false;
+  if (writes.some((c: any) => !/^(insert|createUser)$/.test(calleeName(c)))) return false;
+  if (!writes.length && !/\.(signUp|signUpEmail)\s*\(/.test(text)) return false;
+  if (sinks.some((sk) => sk.isAdminApi && sk.method !== "createUser")) return false;
+  // The caller must not pick a role, a plan, a verified flag or someone else's
+  // id, directly or by spreading their input into the row.
+  const isT = (d: any) => taintedDecls.has(d) ||
+    (Node.isBindingElement(d) && taintedDecls.has(d.getFirstAncestorByKind(SyntaxKind.VariableDeclaration)));
+  const tainted = (n: any) => {
+    if (!n) return false;
+    const ids = Node.isIdentifier(n) ? [n] : n.getDescendantsOfKind(SyntaxKind.Identifier);
+    return ids.some((i: any) => (resolveSymbol(i.getSymbol())?.getDeclarations() ?? []).some(isT));
+  };
+  const calls = writes.concat(node.getDescendantsOfKind(SyntaxKind.CallExpression)
+    .filter((c: any) => /^(signUp|signUpEmail)$/.test(calleeName(c))));
+  for (const c of calls) {
+    for (const arg of c.getArguments()) {
+      if (Node.isIdentifier(arg) && tainted(arg)) return false;                  // insert(input)
+      for (const sp of arg.getDescendantsOfKind(SyntaxKind.SpreadAssignment)) if (tainted(sp.getExpression())) return false;
+      for (const pa of arg.getDescendantsOfKind(SyntaxKind.PropertyAssignment)) {
+        if (SIGNUP_PRIV.has(norm(pa.getName())) && tainted(pa.getInitializer())) return false;
+      }
+      for (const sh of arg.getDescendantsOfKind(SyntaxKind.ShorthandPropertyAssignment)) {
+        if (SIGNUP_PRIV.has(norm(sh.getName())) && (sh.getValueSymbol()?.getDeclarations() ?? []).some(isT)) return false;
+      }
+    }
+  }
+  return true;
+}
+
+// Does the repository authenticate anyone, anywhere? An app with no auth library
+// and no auth call gets one repository-level finding instead of one per action:
+// the fix is "add authentication", not N separate checks.
+const AUTH_DEP = /^(next-auth|@auth\/|@clerk\/|better-auth|lucia|@lucia-auth\/|iron-session|@kinde-oss\/|@workos-inc\/|firebase|firebase-admin|@supabase\/auth-helpers|jose|jsonwebtoken|@stackframe\/|@propelauth\/|passport|bcrypt|bcryptjs|argon2|@node-rs\/argon2|@node-rs\/bcrypt|@oslojs\/|arctic|@descope\/|@auth0\/|@okta\/|@privy-io\/|@dynamic-labs\/|thirdweb|@hanko\/)/;
+const AUTH_TEXT = /\.auth\.(getUser|getSession|getClaims|signIn\w*|signUp|admin)\b|\bgetServerSession\s*\(|\bcurrentUser\s*\(|\bauth\s*\(\s*\)/;
+function repoHasAuth(project: any, repoPath: string): boolean {
+  const pkgs: string[] = [];
+  const walk = (dir: string, depth: number) => {
+    if (depth > 4) return;
+    let entries: fs.Dirent[] = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name === "node_modules" || e.name.startsWith(".")) continue;
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p, depth + 1);
+      else if (e.name === "package.json") pkgs.push(p);
+    }
+  };
+  walk(repoPath, 0);
+  for (const p of pkgs) {
+    try {
+      const j = JSON.parse(fs.readFileSync(p, "utf8"));
+      const deps = Object.keys({ ...(j.dependencies ?? {}), ...(j.devDependencies ?? {}) });
+      if (deps.some((d) => AUTH_DEP.test(d))) return true;
+    } catch { /* unreadable package.json */ }
+  }
+  return project.getSourceFiles().some((f: any) => !f.isInNodeModules() && AUTH_TEXT.test(f.getFullText()));
 }
 
 // --- Authorization (IDOR) ---------------------------------------------------
@@ -1213,6 +1343,7 @@ function scan(repoPath: string): Finding[] {
   const findings: Finding[] = [];
   let exposed: Map<any, Set<string>> | undefined;
   let singleUser: boolean | undefined;
+  let noAuthApp: boolean | undefined;
   for (const file of project.getSourceFiles()) {
     if (!isUseServerFile(file)) continue;
 
@@ -1241,7 +1372,7 @@ function scan(repoPath: string): Finding[] {
       if (FACTORY(name)) continue;
       const db = usesServiceRoleClient(node) ? "supabase" : usesDrizzleClient(node) ? "drizzle" : undefined;
       if (!db) continue;
-      let verdict = classify(node, opts);
+      let verdict = classify(node, { ...opts, name });
       // A Drizzle schema with no per-user or per-tenant column is a single-user
       // app: there is nobody else's row to reach.
       if (verdict === "idor_candidate" && db === "drizzle") {
@@ -1257,6 +1388,10 @@ function scan(repoPath: string): Finding[] {
       if (verdict === "flagged" || verdict === "weak_guard" || verdict === "unreferenced" || verdict === "idor_candidate") {
         reason = stmt ? ignoreReason(stmt) : undefined;
         if (reason) verdict = "ignored";
+      }
+      if (verdict === "flagged") {
+        noAuthApp ??= !repoHasAuth(project, repoPath);
+        if (noAuthApp) verdict = "no_auth";
       }
       findings.push({
         verdict,
@@ -1291,6 +1426,10 @@ if (argv.includes("-h") || argv.includes("--help")) {
   Reported (exit code 1):
     flagged       no guard before the privileged query
     weak_guard    guarded by a user_metadata check, which users can rewrite
+    no_auth       the whole app has no authentication; reported once for the repo
+  Not reported (continued):
+    public_read   only reads non-sensitive tables by non-key or published-only filters
+    auth_flow     a login, or a sign-up where the caller cannot choose a role or id
   Experimental (listed, exit code unaffected):
     idor_candidate  logged in is checked, but a caller-supplied id picks the
                     rows and nothing ties it to the session user
@@ -1323,6 +1462,7 @@ if (!fs.existsSync(repoPath)) {
 const findings = scan(repoPath);
 const flagged = findings.filter((f) => f.verdict === "flagged" || f.verdict === "weak_guard");
 const idor = findings.filter((f) => f.verdict === "idor_candidate");
+const noAuth = findings.filter((f) => f.verdict === "no_auth");
 
 if (asJson) {
   console.log(JSON.stringify({
@@ -1331,6 +1471,9 @@ if (asJson) {
     flagged: flagged.length,
     weak_guard: findings.filter((f) => f.verdict === "weak_guard").length,
     idor_candidate: idor.length,
+    no_auth: noAuth.length,
+    public_read: findings.filter((f) => f.verdict === "public_read").length,
+    auth_flow: findings.filter((f) => f.verdict === "auth_flow").length,
     unreferenced: findings.filter((f) => f.verdict === "unreferenced").length,
     public_write: findings.filter((f) => f.verdict === "public_write").length,
     env_gated: findings.filter((f) => f.verdict === "env_gated").length,
@@ -1349,6 +1492,12 @@ if (asJson) {
         ? `      guarded by a user_metadata check, which users can rewrite themselves`
         : `      argument reaches a ${sinkName(f)} with no guard before it`);
     }
+    if (noAuth.length) {
+      console.log(`  This app has no authentication anywhere (no auth library, no auth call).`);
+      console.log(`      ${noAuth.length} Server Actions using a privileged client are open to anyone; add authentication first.`);
+      if (showAll) for (const f of noAuth) console.log(`      ${f.file}:${f.line}  ${f.fn}`);
+      else console.log(`      (list them with --all)`);
+    }
     if (idor.length) {
       console.log(`\n  Possible IDOR (experimental, does not fail the run):`);
       for (const f of idor) {
@@ -1357,17 +1506,18 @@ if (asJson) {
       }
     }
     if (showAll) {
-      for (const f of findings.filter((x) => x.verdict !== "flagged" && x.verdict !== "weak_guard" && x.verdict !== "idor_candidate")) {
+      for (const f of findings.filter((x) => !["flagged", "weak_guard", "idor_candidate", "no_auth"].includes(x.verdict))) {
         console.log(`  ok  ${f.file}:${f.line}  ${f.fn}  (${f.verdict}${f.reason ? `: ${f.reason}` : ""})`);
       }
     }
     console.log(
       `\n${findings.length} Server Actions using a privileged client, ` +
       `${flagged.length} flagged, ` +
+      (noAuth.length ? `${noAuth.length} in an app with no auth, ` : "") +
       (idor.length ? `${idor.length} possible IDOR, ` : "") +
-      `${findings.length - flagged.length - idor.length} passed.`
+      `${findings.length - flagged.length - noAuth.length - idor.length} passed.`
     );
-    if (flagged.length) {
+    if (flagged.length || noAuth.length) {
       console.log(
         "\nThese are candidates, not confirmed vulnerabilities. Public endpoints that\n" +
         "legitimately take a tenant key or public token look identical to this check.\n" +
@@ -1392,6 +1542,10 @@ if (argv.includes("--github")) {
     : `${f.fn}: a caller-supplied value reaches a ${sinkName(f)} with no auth check before it. Server Actions are public POST endpoints. Add a session/role check, or mark it // actionguard-ignore: <reason> if it is public on purpose.`;
   for (const f of idor) {
     console.log(`::notice file=${escProp(rel(f))},line=${f.line},title=${escProp("ActionGuard: possible IDOR")}::${esc(`${f.fn}: a logged-in user can pass any id here; nothing compares it with the session user. Scope the query by the session user (or check ownership) before using it.`)}`);
+  }
+  if (noAuth.length) {
+    const f = noAuth[0];
+    console.log(`::warning file=${escProp(rel(f))},line=${f.line},title=${escProp("ActionGuard: no authentication")}::${esc(`This app has no authentication anywhere. ${noAuth.length} Server Actions using a privileged client are open to anyone (first: ${f.fn}).`)}`);
   }
   for (const f of flagged) {
     console.log(`::warning file=${escProp(rel(f))},line=${f.line},title=${escProp("ActionGuard: " + f.verdict)}::${esc(message(f))}`);
@@ -1418,4 +1572,4 @@ if (argv.includes("--github")) {
   }
 }
 
-process.exit(flagged.length > 0 ? 1 : 0);
+process.exit(flagged.length > 0 || noAuth.length > 0 ? 1 : 0);

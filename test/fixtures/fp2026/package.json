@@ -1,0 +1,1 @@
+{ "name": "fixture-fp2026", "private": true, "dependencies": { "next-auth": "^5.0.0" } }

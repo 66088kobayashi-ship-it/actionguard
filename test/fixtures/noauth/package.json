@@ -1,0 +1,1 @@
+{ "name": "fixture-noauth", "private": true, "dependencies": { "@supabase/supabase-js": "^2.45.0" } }
