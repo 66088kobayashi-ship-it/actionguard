@@ -1,0 +1,13 @@
+{
+  "deleteProject": "idor_candidate",
+  "deleteMyProject": "guard_before_sink",
+  "archiveProject": "guard_before_sink",
+  "banUser": "guard_before_sink",
+  "purgeOrgLogs": "guard_before_sink",
+  "listCustomers": "idor_candidate",
+  "createNoteFor": "idor_candidate",
+  "findBySlug": "guard_before_sink",
+  "getInvoice": "guard_before_sink",
+  "deleteNote": "idor_candidate",
+  "deleteMyNote": "guard_before_sink"
+}

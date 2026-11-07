@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: 66088kobayashi-ship-it/actionguard@v0.5.2
+      - uses: 66088kobayashi-ship-it/actionguard@v0.6.0
         # with:
         #   path: apps/web              # where the Next.js app lives
         #   fail-on-findings: "false"   # report without failing the job
@@ -96,6 +96,7 @@ only `parsedInput` is treated as caller-supplied.
 | `ignored` | would be reported, but marked `// actionguard-ignore: <reason>` | 0 |
 | `unreferenced` | would be flagged, but on Next.js ≥ 15 no client code references it, so it gets no action ID | 0 |
 | `env_gated` | unguarded, but returns or throws early unless an opt-in flag allows it (`DEMO_MODE !== "true"`, `!ENABLE_RESET`) or when running in production (`NODE_ENV === "production"`). A check that a setting exists (`!process.env.SUPABASE_SERVICE_ROLE_KEY`) is not a gate and stays `flagged`. A misconfigured deployment still exposes it | 0 |
+| `idor_candidate` | **experimental** — a login check runs first, but a caller-supplied value picks the rows (an id-like column, an Admin API target, the owner column of a new row) and neither the query nor any check involves the session user. Listed under "Possible IDOR"; never fails the run | 0 |
 | `public_write` | only inserts caller values into content columns of a public-submission table (contact, feedback, waitlist, reports...). Any `*_id`, role, owner or status column keeps it `flagged` | 0 |
 | `guard_before_sink` / `no_tainted_sink` | passed | 0 |
 
@@ -228,6 +229,33 @@ Web Crypto HMAC session, and early `process.env` exits now reported as `env_gate
 35 of the 55 remaining were real (**about 64%**). The rest were mostly public on purpose,
 gated by a secret token, or a single-user local app. Treat it as experimental: the sample
 is small and the shapes of Drizzle code vary more than Supabase's.
+
+### Authorization / IDOR (experimental, v0.6.0)
+
+A login check is not authorization. `await requireUser()` followed by
+`.delete().eq("id", id)` lets any signed-in user delete anyone's row. Until v0.6.0 that
+passed as `guard_before_sink`. Now it is reported as `idor_candidate` when:
+
+- the caller's value is used as a key: an id-like column in `.eq/.in/.match`, Drizzle
+  `eq(table.xId, ...)`, a Supabase Admin API target, or an owner column of an insert
+  (`user_id`, `orgId`, `created_by`...; a foreign key to a shared row such as `productId`
+  does not count), and
+- the statement that runs the query does not use anything derived from the session, and
+- nothing before it decides on the session user: a comparison (`row.owner_id !== user.id`),
+  a helper given both the session and the id (`assertMember(user.id, orgId)`), a guard given
+  the id (`authProject({ projectId })`), a role guard (`requireAdmin()`, a local guard whose
+  body checks a role or permission), or a server-side secret. A read may be checked after it
+  runs, as long as the check comes before anything is returned.
+
+Drizzle repositories whose tables have no owner-like column at all are treated as single-user
+and skipped.
+
+Measured on the 125 Drizzle repositories above plus 6 others (November 2026): 54 candidates
+in 13 repositories, out of about 2,900 actions that pass the login check. On 18 candidates I
+had not used while writing the rules: **6 real, 7 false, 5 unclear** (33% counting unclear as
+false, 46% without them). The false ones were mostly single-admin CMSs and internal tools
+where every signed-in person is staff, which the source alone cannot tell apart from a
+multi-tenant app. That is why it does not fail the run yet.
 
 ## The corpus
 

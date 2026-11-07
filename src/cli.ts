@@ -110,6 +110,7 @@ type Verdict =
   | "public_write"       // caller-supplied values only land in content columns of an insert
   | "env_gated"          // unguarded, but an early process.env check limits where it runs
   | "ignored"            // would be reported, but marked `// actionguard-ignore: <reason>`
+  | "idor_candidate"     // guarded, but a caller-supplied id picks the rows and nothing ties it to the session
   | "guard_before_sink"
   | "no_tainted_sink";
 
@@ -584,6 +585,7 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
 
   let sinkPos = Infinity;
   let contentInsert = false;
+  const sinks: Sink[] = [];
   for (const call of node.getDescendantsOfKind(SyntaxKind.CallExpression)) {
     const expr = call.getExpression();
     if (!Node.isPropertyAccessExpression(expr)) continue;
@@ -619,6 +621,7 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
           }
         }
         sinkPos = Math.min(sinkPos, call.getPos());
+        sinks.push({ call, t, arg, method, isAdminApi, isDrizzle });
       }
     }
   }
@@ -671,7 +674,206 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
       Node.isConditionalExpression(cond) ? cond.getCondition() : undefined;
     if (test && /\buser_metadata\b/.test(test.getText())) return "weak_guard";
   }
+  if (!opts.preGuarded || opts.safeAction) {
+    if (looksLikeIdor(node, sinks, sinkPos, taintedDecls, opts)) return "idor_candidate";
+  }
   return "guard_before_sink";
+}
+
+// --- Authorization (IDOR) ---------------------------------------------------
+// The action checks that *someone* is logged in, but does it check that the
+// rows it touches are theirs? Candidate when a caller-supplied value is used
+// as a key (an id-like column, an Admin API target, an owner column of an
+// insert) and neither that query nor any check in the action involves the
+// session user. Experimental: reported, but never fails the run.
+interface Sink { call: any; t: any; arg: any; method: string; isAdminApi: boolean; isDrizzle: boolean }
+
+const ID_COL = /(^id$|_id$|[a-z]Id$|^uuid$|^(owner|user|email|tenant|org|organization|company|team|workspace|account|member)$)/;
+// Columns that say whose a new row is. A caller-chosen foreign key to a shared
+// entity (productId, restaurantId) is normal; a caller-chosen owner is not.
+const OWNER_KEY = /^(owner|user|createdby|addedby|(user|owner|org|organization|tenant|company|team|workspace|account|member|author|creator|profile)id)$/;
+const norm = (k: string) => k.replace(/['"`]/g, "").replace(/_/g, "").toLowerCase();
+// A local guard whose body makes a role/permission decision authorizes, not
+// just authenticates: requireAdmin(), guardAgent(), requireStaff("x"), requireCan("x").
+const ROLE_BODY = /role|admin|permission|\bstaff\b|\bcan\(|hasAccess/i;
+const AUTHZ_NAME = /(admin|role|permission|owner|member|access|^can[A-Z]|[a-z]Can([A-Z]|$)|authori[sz]e|policy|ability|belongs|isAllowed|staff|manager|moderator|superuser)/i;
+const WRITE_CALL = /\.(update|delete|insert|upsert)\s*\(|\b(deleteUser|updateUserById|generateLink|inviteUserByEmail|createUser)\b/;
+
+function lastName(text: string): string {
+  const m = text.match(/([A-Za-z_$][\w$]*)\s*$/);
+  return m ? m[1] : text;
+}
+
+// Is the tainted node used as the key that picks rows (or the owner of a new row)?
+function usedAsKey(sk: Sink): boolean {
+  const { call, t, arg, method, isAdminApi, isDrizzle } = sk;
+  if (isAdminApi) return true;
+  const args = call.getArguments();
+  if (!isDrizzle) {
+    if (["eq", "in", "filter"].includes(method)) {
+      const col = args[0];
+      if (col && (Node.isStringLiteral(col) || Node.isNoSubstitutionTemplateLiteral(col))) {
+        return ID_COL.test(col.getLiteralText().split(".").pop() ?? "");
+      }
+      return false;
+    }
+    if (method === "match") {
+      const pa = t.getFirstAncestorByKind(SyntaxKind.PropertyAssignment);
+      return !!pa && ID_COL.test(pa.getName());
+    }
+    if (method === "insert" || method === "upsert") {
+      const col = insertColumn(t, arg);   // normalised: lower case, no underscores
+      return col !== undefined && OWNER_KEY.test(norm(col));
+    }
+    return false;
+  }
+  if (method === "values") {
+    const pa = t.getFirstAncestorByKind(SyntaxKind.PropertyAssignment);
+    const sh = t.getParent();
+    const name = pa && pa.getPos() >= arg.getPos() ? pa.getName()
+      : Node.isShorthandPropertyAssignment(sh) ? sh.getName() : undefined;
+    return !!name && OWNER_KEY.test(norm(name));
+  }
+  if (method === "set") return false;
+  // where / findFirst / findMany: eq(table.col, x), inArray(table.col, xs)
+  for (const c of t.getAncestors()) {
+    if (c === call) break;
+    if (Node.isCallExpression(c) && /^(eq|inArray|ne)$/.test(calleeName(c))) {
+      const a0 = c.getArguments()[0];
+      const col = a0 ? lastName(a0.getText()) : "";
+      return ID_COL.test(col) && !SECRET_COL.test(col);
+    }
+    if (Node.isPropertyAssignment(c) && c.getName() !== "where") return ID_COL.test(c.getName());
+  }
+  return false;
+}
+
+function looksLikeIdor(node: any, sinks: Sink[], sinkPos: number, taintedDecls: Set<any>, opts: ClassifyOpts): boolean {
+  // Session-derived declarations: initialised from a guard call, then anything
+  // computed from those (`const userId = user.id`, a profile read by user.id).
+  const guardCalls = node.getDescendantsOfKind(SyntaxKind.CallExpression)
+    .filter((c: any) => isGuardCall(c, 0, new Set()));
+  const inGuard = (n: any) => guardCalls.some((g: any) => n.getPos() >= g.getPos() && n.getEnd() <= g.getEnd());
+  const session = new Set<any>();
+  const vds = node.getDescendantsOfKind(SyntaxKind.VariableDeclaration);
+  for (const vd of vds) {
+    const init = vd.getInitializer();
+    if (init && guardCalls.some((g: any) => g.getPos() >= init.getPos() && g.getEnd() <= init.getEnd())) {
+      session.add(vd);
+      vd.getNameNode().getDescendantsOfKind(SyntaxKind.BindingElement).forEach((b: any) => session.add(b));
+    }
+  }
+  const declOf = (i: any) => {
+    const par = i.getParent();
+    const sym = Node.isShorthandPropertyAssignment(par) && par.getNameNode() === i ? par.getValueSymbol() : i.getSymbol();
+    return resolveSymbol(sym)?.getDeclarations() ?? [];
+  };
+  // `ctx = await assertManager()` (assigned, not declared)
+  for (const be of node.getDescendantsOfKind(SyntaxKind.BinaryExpression)) {
+    if (be.getOperatorToken().getText() !== "=" || !Node.isIdentifier(be.getLeft())) continue;
+    if (guardCalls.some((g: any) => g.getPos() >= be.getRight().getPos() && g.getEnd() <= be.getRight().getEnd())) {
+      declOf(be.getLeft()).forEach((d: any) => session.add(d));
+    }
+  }
+  // `if (!proj) throw new Error("Unauthorized")`: proj is what the guard decided on.
+  for (const st of node.getDescendantsOfKind(SyntaxKind.IfStatement)) {
+    if (!AUTH_ERROR.test(st.getThenStatement().getText())) continue;
+    for (const i of st.getExpression().getDescendantsOfKind(SyntaxKind.Identifier).concat(
+      Node.isIdentifier(st.getExpression()) ? [st.getExpression()] : [])) {
+      declOf(i).filter((d: any) => Node.isVariableDeclaration(d) || Node.isBindingElement(d)).forEach((d: any) => session.add(d));
+    }
+  }
+  const refsSession = (n: any): boolean => {
+    if (inGuard(n) || guardCalls.some((g: any) => g.getPos() >= n.getPos() && g.getEnd() <= n.getEnd())) return true;
+    if (opts.safeAction && /\bctx\b/.test(n.getText())) return true;
+    const ids = Node.isIdentifier(n) ? [n] : n.getDescendantsOfKind(SyntaxKind.Identifier);
+    return ids.some((i: any) => declOf(i).some((d: any) => session.has(d)));
+  };
+  for (let pass = 0; pass < 2; pass++) {
+    for (const vd of vds) {
+      if (session.has(vd)) continue;
+      const init = vd.getInitializer();
+      if (init && refsSession(init)) {
+        session.add(vd);
+        vd.getNameNode().getDescendantsOfKind(SyntaxKind.BindingElement).forEach((b: any) => session.add(b));
+      }
+    }
+  }
+  // Destructured locals (`const { projectId } = schema.parse(...)`) declare on
+  // a binding element; the tainted set holds its variable declaration.
+  const isTaintedDecl = (d: any) => taintedDecls.has(d) ||
+    (Node.isBindingElement(d) && taintedDecls.has(d.getFirstAncestorByKind(SyntaxKind.VariableDeclaration)));
+  const touchesTaint = (n: any) => {
+    const ids = Node.isIdentifier(n) ? [n] : n.getDescendantsOfKind(SyntaxKind.Identifier);
+    return ids.some((i: any) => declOf(i).some(isTaintedDecl));
+  };
+  const exits = (st: any) => {
+    const then = st.getThenStatement();
+    const stmts = Node.isBlock(then) ? then.getStatements() : [then];
+    const last = stmts[stmts.length - 1];
+    return !!last && (Node.isReturnStatement(last) || Node.isThrowStatement(last) ||
+      /\b(redirect|notFound|forbidden|unauthorized)\s*\(/.test(then.getText()));
+  };
+  // A decision about the session user beyond "is there one": a comparison, a
+  // call, or a role/ownership read. `if (!user) throw` does not count.
+  const decides = (cond: any) =>
+    [cond, ...cond.getDescendantsOfKind(SyntaxKind.BinaryExpression)].some((b: any) => Node.isBinaryExpression(b) &&
+      /^(===|!==|==|!=)$/.test(b.getOperatorToken().getText())) ||
+    cond.getDescendantsOfKind(SyntaxKind.CallExpression).length > 0 ||
+    /role|admin|permission|owner|member/i.test(cond.getText());
+  // ...or a server-side secret the caller must know (`token !== process.env.MOD_TOKEN`):
+  // whoever holds it is privileged, so any id is fair game.
+  const checks = node.getDescendantsOfKind(SyntaxKind.IfStatement)
+    .filter((st: any) => (exits(st) || isLoginRedirectStmt(st)) &&
+      ((refsSession(st.getExpression()) && decides(st.getExpression())) || comparesToEnvSecret(st.getExpression().getText())));
+  // A helper that is handed both the session and the caller's id
+  // (`assertOwner(user.id, projectId)`), or a role-named guard (`requireAdmin()`).
+  const authzCalls = node.getDescendantsOfKind(SyntaxKind.CallExpression).filter((c: any) => {
+    const name = calleeName(c);
+    const isGuard = isGuardCall(c, 0, new Set());
+    if (AUTHZ_NAME.test(name) && (isGuard || localCallee(c) || GUARD_NAME.test(name))) return true;
+    const a = c.getArguments();
+    // a guard handed the caller's id checks access to it: authProject({ projectId })
+    if (isGuard && a.some((x: any) => touchesTaint(x))) return true;
+    if (isGuard) {
+      const fn = localCallee(c);
+      if (fn && ROLE_BODY.test(fn.getText())) return true;
+    }
+    // invariant(session.user.role === "admin", "...")
+    if (/^(invariant|assert|ensure|check)/i.test(name) && a.some((x: any) => refsSession(x) && decides(x))) return true;
+    return a.some((x: any) => refsSession(x)) && a.some((x: any) => touchesTaint(x));
+  });
+  // A read of a referenced row (the product to favourite, the event to join)
+  // followed by a write scoped to the session user is a lookup, not a leak.
+  const scopedWrites = node.getDescendantsOfKind(SyntaxKind.CallExpression)
+    .filter((c: any) => /^(insert|update|delete|upsert)$/.test(calleeName(c)))
+    .map((c: any) => c.getAncestors().find((x: any) => Node.isStatement(x) && !Node.isBlock(x)) ?? c)
+    .filter((st: any) => refsSession(st));
+
+  function isLoginRedirectStmt(st: any) {
+    return st.getThenStatement().getDescendantsOfKind(SyntaxKind.CallExpression).some((c: any) => isLoginRedirect(c)) ||
+      (Node.isExpressionStatement(st.getThenStatement()) && Node.isCallExpression(st.getThenStatement().getExpression()) &&
+       isLoginRedirect(st.getThenStatement().getExpression()));
+  }
+  const statementOf = (n: any) => n.getAncestors().find((a: any) => Node.isStatement(a) && !Node.isBlock(a)) ?? n;
+  for (const sk of sinks) {
+    if (!usedAsKey(sk)) continue;
+    const stmt = statementOf(sk.call);
+    if (refsSession(stmt)) continue;                       // the query itself is scoped to the session
+    const pos = sk.call.getPos();
+    const isWrite = sk.isAdminApi || WRITE_CALL.test(stmt.getText());
+    if (!isWrite && scopedWrites.some((c: any) => c.getPos() > pos)) continue;
+    // Writes must be authorized before they run; a read may be checked after
+    // (`if (doc.ownerId !== user.id) throw`) as long as it is not returned first.
+    const ok = checks.some((st: any) => isWrite ? st.getPos() < pos : true) ||
+      authzCalls.some((c: any) => c !== sk.call && !(c.getPos() >= stmt.getPos() && c.getEnd() <= stmt.getEnd()) &&
+        (isWrite ? c.getPos() < pos : true));
+    if (!ok) {
+      if (process.env.ACTIONGUARD_DEBUG) console.error(`idor: ${stmt.getText().slice(0, 200).replace(/\s+/g, " ")} | checks=${checks.length} authz=${authzCalls.map((c: any) => calleeName(c)).join(",")} session=${[...session].map((d: any) => d.getName?.()).join(",")}`);
+      return true;
+    }
+  }
+  return false;
 }
 
 
@@ -984,6 +1186,15 @@ function dynamicImportNames(call: any): string[] | "*" {
   return "*";
 }
 
+// true when the repository defines Drizzle tables and none of them has an
+// owner-like column (user_id, ownerId, organization_id, tenant, created_by...).
+const OWNER_COL_TEXT = /["'`]?\b(user_?id|owner(_?id)?|org(anization)?_?id|tenant(_?id)?|team_?id|workspace_?id|account_?id|member_?id|created_?by|author_?id|profile_?id)\b/i;
+function drizzleSchemaHasNoOwner(project: any): boolean {
+  const tables = project.getSourceFiles().filter((f: any) => /\b(pgTable|sqliteTable|mysqlTable)\s*\(/.test(f.getFullText()));
+  if (!tables.length) return false;
+  return !tables.some((f: any) => OWNER_COL_TEXT.test(f.getFullText()));
+}
+
 function scan(repoPath: string): Finding[] {
   const tsConfigPath = path.join(repoPath, "tsconfig.json");
   const hasTsConfig = fs.existsSync(tsConfigPath);
@@ -1001,6 +1212,7 @@ function scan(repoPath: string): Finding[] {
 
   const findings: Finding[] = [];
   let exposed: Map<any, Set<string>> | undefined;
+  let singleUser: boolean | undefined;
   for (const file of project.getSourceFiles()) {
     if (!isUseServerFile(file)) continue;
 
@@ -1030,13 +1242,19 @@ function scan(repoPath: string): Finding[] {
       const db = usesServiceRoleClient(node) ? "supabase" : usesDrizzleClient(node) ? "drizzle" : undefined;
       if (!db) continue;
       let verdict = classify(node, opts);
-      if ((verdict === "flagged" || verdict === "weak_guard") && major !== undefined && major >= 15) {
+      // A Drizzle schema with no per-user or per-tenant column is a single-user
+      // app: there is nobody else's row to reach.
+      if (verdict === "idor_candidate" && db === "drizzle") {
+        singleUser ??= drizzleSchemaHasNoOwner(project);
+        if (singleUser) verdict = "guard_before_sink";
+      }
+      if ((verdict === "flagged" || verdict === "weak_guard" || verdict === "idor_candidate") && major !== undefined && major >= 15) {
         exposed ??= exposedExports(project);
         const names = exposed.get(file);
         if (!names || !(names.has("*") || names.has(name))) verdict = "unreferenced";
       }
       let reason: string | undefined;
-      if (verdict === "flagged" || verdict === "weak_guard" || verdict === "unreferenced") {
+      if (verdict === "flagged" || verdict === "weak_guard" || verdict === "unreferenced" || verdict === "idor_candidate") {
         reason = stmt ? ignoreReason(stmt) : undefined;
         if (reason) verdict = "ignored";
       }
@@ -1073,6 +1291,9 @@ if (argv.includes("-h") || argv.includes("--help")) {
   Reported (exit code 1):
     flagged       no guard before the privileged query
     weak_guard    guarded by a user_metadata check, which users can rewrite
+  Experimental (listed, exit code unaffected):
+    idor_candidate  logged in is checked, but a caller-supplied id picks the
+                    rows and nothing ties it to the session user
   Not reported (exit code 0, listed with --all):
     unreferenced  Next.js >= 15 and no client code references it
     public_write  only inserts caller values into content columns (a form)
@@ -1101,6 +1322,7 @@ if (!fs.existsSync(repoPath)) {
 
 const findings = scan(repoPath);
 const flagged = findings.filter((f) => f.verdict === "flagged" || f.verdict === "weak_guard");
+const idor = findings.filter((f) => f.verdict === "idor_candidate");
 
 if (asJson) {
   console.log(JSON.stringify({
@@ -1108,6 +1330,7 @@ if (asJson) {
     server_actions_using_service_role: findings.length,
     flagged: flagged.length,
     weak_guard: findings.filter((f) => f.verdict === "weak_guard").length,
+    idor_candidate: idor.length,
     unreferenced: findings.filter((f) => f.verdict === "unreferenced").length,
     public_write: findings.filter((f) => f.verdict === "public_write").length,
     env_gated: findings.filter((f) => f.verdict === "env_gated").length,
@@ -1126,15 +1349,23 @@ if (asJson) {
         ? `      guarded by a user_metadata check, which users can rewrite themselves`
         : `      argument reaches a ${sinkName(f)} with no guard before it`);
     }
+    if (idor.length) {
+      console.log(`\n  Possible IDOR (experimental, does not fail the run):`);
+      for (const f of idor) {
+        console.log(`  ${f.file}:${f.line}  ${f.fn}`);
+        console.log(`      logged in is checked, but a caller-supplied id picks the rows and nothing ties it to the session user`);
+      }
+    }
     if (showAll) {
-      for (const f of findings.filter((x) => x.verdict !== "flagged" && x.verdict !== "weak_guard")) {
+      for (const f of findings.filter((x) => x.verdict !== "flagged" && x.verdict !== "weak_guard" && x.verdict !== "idor_candidate")) {
         console.log(`  ok  ${f.file}:${f.line}  ${f.fn}  (${f.verdict}${f.reason ? `: ${f.reason}` : ""})`);
       }
     }
     console.log(
       `\n${findings.length} Server Actions using a privileged client, ` +
       `${flagged.length} flagged, ` +
-      `${findings.length - flagged.length} passed.`
+      (idor.length ? `${idor.length} possible IDOR, ` : "") +
+      `${findings.length - flagged.length - idor.length} passed.`
     );
     if (flagged.length) {
       console.log(
@@ -1159,6 +1390,9 @@ if (argv.includes("--github")) {
   const message = (f: Finding) => f.verdict === "weak_guard"
     ? `${f.fn}: the admin check reads user_metadata, which users can change themselves. Read the role from app_metadata or a protected table.`
     : `${f.fn}: a caller-supplied value reaches a ${sinkName(f)} with no auth check before it. Server Actions are public POST endpoints. Add a session/role check, or mark it // actionguard-ignore: <reason> if it is public on purpose.`;
+  for (const f of idor) {
+    console.log(`::notice file=${escProp(rel(f))},line=${f.line},title=${escProp("ActionGuard: possible IDOR")}::${esc(`${f.fn}: a logged-in user can pass any id here; nothing compares it with the session user. Scope the query by the session user (or check ownership) before using it.`)}`);
+  }
   for (const f of flagged) {
     console.log(`::warning file=${escProp(rel(f))},line=${f.line},title=${escProp("ActionGuard: " + f.verdict)}::${esc(message(f))}`);
   }

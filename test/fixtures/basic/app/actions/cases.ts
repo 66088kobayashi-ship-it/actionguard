@@ -7,7 +7,7 @@ export async function awardXp(userId: string, xp: number) {
   await supabaseAdmin.from("profiles").update({ xp }).eq("id", userId);
 }
 
-// B: guard before the sink. Expect: guard_before_sink
+// B: guard before the sink. Logged in, but any teamId works. Expect: idor_candidate
 export async function renameTeam(teamId: string, name: string) {
   await requireUser();
   await supabaseAdmin.from("teams").update({ name }).eq("id", teamId);
@@ -36,7 +36,7 @@ export async function countMine(ids: string[]) {
   return (data ?? []).filter((r: any) => ids.includes(r.id)).length;
 }
 
-// G: guard behind a helper with a neutral name. Expect: guard_before_sink
+// G: guard behind a helper with a neutral name (found; any projectId works). Expect: idor_candidate
 export async function archiveProject(projectId: string) {
   await getProfileOrThrow();
   await supabaseAdmin.from("projects").update({ archived: true }).eq("id", projectId);
@@ -62,7 +62,7 @@ export async function updateEmail(userId: string, email: string) {
   await supabaseAdmin.from("profiles").update({ email }).eq("id", userId);
 }
 
-// K: auth two helpers deep. Expect: guard_before_sink
+// K: auth two helpers deep (found; any accountId works). Expect: idor_candidate
 export async function closeAccount(accountId: string) {
   await withAccount();
   await supabaseAdmin.from("accounts").delete().eq("id", accountId);
@@ -77,7 +77,7 @@ export async function moveTask(taskId: string) {
   await q;
 }
 
-// M: auth four helpers deep (d1 -> d2 -> d3 -> d4 -> getUser). Expect: guard_before_sink
+// M: auth four helpers deep (d1 -> d2 -> d3 -> d4 -> getUser), found; any orgId works. Expect: idor_candidate
 export async function purgeLogs(orgId: string) {
   await d1();
   await supabaseAdmin.from("logs").delete().eq("org_id", orgId);
@@ -108,7 +108,7 @@ export async function resetQuota(accountId: string) {
 
 import { actionClient, authActionClient, withAuth } from "@/lib/safe-action";
 
-// Q: next-safe-action behind an auth middleware. Expect: guard_before_sink
+// Q: next-safe-action behind an auth middleware; ctx is never used, so any invoiceId works. Expect: idor_candidate
 export const deleteInvoice = authActionClient
   .schema({})
   .action(async ({ parsedInput: { invoiceId } }: any) => {
@@ -155,7 +155,7 @@ export const bumpLikes = async (slug: string) => {
   await supabaseAdmin.from("likes").update({ n: 1 }).eq("slug", slug);
 };
 
-// X: ignore comment on a passing action changes nothing. Expect: guard_before_sink
+// X: ignore comment on an IDOR candidate. Expect: ignored
 // actionguard-ignore: not needed
 export async function renameTeam2(teamId: string, name: string) {
   await requireUser();
@@ -165,7 +165,7 @@ export async function renameTeam2(teamId: string, name: string) {
 import { requireRep, requireAdminAuth } from "@/lib/rep";
 import { redirect } from "next/navigation";
 
-// Y1: guard behind cache(namedFn). Expect: guard_before_sink
+// Y1: guard behind cache(namedFn), found; any profileId works. Expect: idor_candidate
 export async function savePitch(profileId: string, pitch: string) {
   await requireRep();
   await supabaseAdmin.from("profiles").update({ pitch }).eq("id", profileId);
