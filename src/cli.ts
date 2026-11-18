@@ -18,7 +18,7 @@ import * as path from "path";
 // ---------------------------------------------------------------------------
 
 const SERVICE_KEY = ["SERVICE_ROLE", "SUPABASE_SERVICE_KEY", "sb_secret_"];
-const SINK = ["eq", "in", "match", "insert", "update", "upsert", "delete", "filter", "or"];
+const SINK = ["eq", "in", "match", "insert", "update", "upsert", "delete", "filter", "or", "ilike", "like"];
 // A sink only counts when it sits on a database query chain: `<client>.from(...)...`.
 // Without this, Array.prototype.filter, String.prototype.match and
 // hash.update(...) all look like queries.
@@ -98,6 +98,7 @@ function queryTable(expr: any): string | undefined {
 // A hand-rolled session counts as authentication when the helper both reads the
 // request (cookies()/headers()) and verifies what it read (HMAC, hash compare,
 // JWT). Reading a cookie alone does not count: presence of a cookie is forgeable.
+const SESSION_LOOKUP = /\.from\(\s*["'`]?\w*sessions?(Table)?\b|\b\w*sessions?\.(findFirst|findUnique|findMany)\s*\(/i;
 const VERIFY_FN = new Set([
   "createHmac", "createHash", "timingSafeEqual", "jwtVerify", "verify",
   "unsealData", "getIronSession", "compare", "compareSync", "decrypt",
@@ -260,7 +261,11 @@ function localCallee(call: any): any | undefined {
   for (const d of resolveSymbol(id.getSymbol())?.getDeclarations() ?? []) {
     const sf = d.getSourceFile();
     if (sf.isDeclarationFile() || sf.isInNodeModules()) continue;
-    if (Node.isFunctionDeclaration(d) || Node.isMethodDeclaration(d)) return d;
+    // Overload signatures have no body; the implementation is the one with a body.
+    if (Node.isFunctionDeclaration(d) || Node.isMethodDeclaration(d)) {
+      if (!d.getBody()) continue;
+      return d;
+    }
     if (Node.isVariableDeclaration(d)) {
       const init = d.getInitializer();
       if (init && (Node.isArrowFunction(init) || Node.isFunctionExpression(init))) return init;
@@ -293,6 +298,7 @@ function isGuardCall(call: any, depth: number, path: Set<any>): boolean {
   const name = calleeName(call);
   if (GUARD_MEMBER.has(name) || AUTH_FN.has(name)) return true;
   if (isLoginRedirect(call)) return true;
+  if (isPermissionRpc(call)) return true;
   const fn = localCallee(call);
   if (!fn) return GUARD_NAME.test(name);
   if (depth >= GUARD_DEPTH || path.has(fn)) return false;
@@ -301,6 +307,25 @@ function isGuardCall(call: any, depth: number, path: Set<any>): boolean {
     .some((c: any) => isGuardCall(c, depth + 1, path));
   path.delete(fn);
   return found;
+}
+
+// `supabase.rpc("check_permission", {...})` / `rpc("has_permission")` on the
+// user's own (cookie) client: a database function that decides with auth.uid().
+// On a service_role client auth.uid() is null, so that is not a check.
+const PERMISSION_RPC = /^(check_|has_|can_|is_)?\w*(permission|role|access|authori[sz]\w*|admin|member)\w*$/i;
+function isPermissionRpc(call: any): boolean {
+  if (calleeName(call) !== "rpc") return false;
+  const a0 = call.getArguments()[0];
+  if (!a0 || !(Node.isStringLiteral(a0) || Node.isNoSubstitutionTemplateLiteral(a0))) return false;
+  const fname = a0.getLiteralText();
+  if (!/^(check|has|can|is|require|assert|ensure|current|user_has|authori[sz]e)_/i.test(fname) || !PERMISSION_RPC.test(fname)) return false;
+  // Passing the user id in (`{ p_user_id: userId }`) lets the caller pick who is checked.
+  const a1 = call.getArguments()[1];
+  if (a1 && /\b\w*(user_?id|uid|profile_?id|member_?id)\w*\s*:/i.test(a1.getText())) return false;
+  const e = call.getExpression();
+  if (!Node.isPropertyAccessExpression(e)) return false;
+  // On a service_role client auth.uid() is null, so the check proves nothing.
+  return clientIsServiceRole(e.getExpression()) !== true;
 }
 
 // Does this helper (or a local helper it calls) read the request AND verify it?
@@ -315,6 +340,11 @@ function verifiesSession(fn: any): boolean {
       if (VERIFY_FN.has(n)) verifies = true;
       // Web Crypto: `crypto.subtle.sign("HMAC", ...)`, `subtle.verify(...)`, `subtle.digest(...)`
       if (/\bsubtle\.(sign|verify|digest|importKey)\b/.test(c.getExpression().getText())) verifies = true;
+      // Lucia-style sessions: the cookie token is hashed (sha256) and looked up in
+      // a sessions table: `db.select().from(sessionTable).where(eq(sessionTable.id, id))`,
+      // `supabase.from("sessions").select()...`, `prisma.session.findUnique(...)`.
+      if (n === "sha256") verifies = true;
+      if (/^(from|findFirst|findUnique|findMany)$/.test(n) && SESSION_LOOKUP.test(c.getText().slice(0, 2000))) verifies = true;
       const inner = localCallee(c);
       if (inner) visit(inner, depth + 1, seen);
     }
@@ -582,6 +612,12 @@ function classify(node: any, opts: ClassifyOpts = {}): Verdict {
       if (touches) {
         taintedDecls.add(vd);
         refsOf(vd).forEach((n) => tainted.add(n));
+        // `const { email, role } = data`: the names live on the binding elements.
+        for (const el of vd.getNameNode().getDescendantsOfKind(SyntaxKind.BindingElement)) {
+          if (taintedDecls.has(el)) continue;
+          taintedDecls.add(el);
+          refsOf(el).forEach((n) => tainted.add(n));
+        }
       }
     }
   }
@@ -1021,6 +1057,13 @@ const isUseClientFile = (sf: any) => {
     /^['"]use client['"];?$/.test(first.getText().trim());
 };
 
+function importsOnlyAType(spec: any): boolean {
+  const sym = resolveSymbol(spec.getNameNode().getSymbol());
+  const decls = sym?.getDeclarations() ?? [];
+  return decls.length > 0 && decls.every((d: any) =>
+    Node.isTypeAliasDeclaration(d) || Node.isInterfaceDeclaration(d));
+}
+
 // Value imports only: `import type { X }` and `import { type X }` never reach the bundle.
 function valueImports(sf: any): { decl: any; target: any; names: string[]; star: boolean; locals: any[] }[] {
   const out: any[] = [];
@@ -1028,7 +1071,9 @@ function valueImports(sf: any): { decl: any; target: any; names: string[]; star:
     if (decl.isTypeOnly()) continue;
     const target = decl.getModuleSpecifierSourceFile();
     if (!target) continue;
-    const named = decl.getNamedImports().filter((n: any) => !n.isTypeOnly());
+    // `import { ActionState } from "./x"` where ActionState is a type alias or an
+    // interface is elided by the compiler just like `import type`.
+    const named = decl.getNamedImports().filter((n: any) => !n.isTypeOnly() && !importsOnlyAType(n));
     const ns = decl.getNamespaceImport();
     const def = decl.getDefaultImport();
     if (!named.length && !ns && !def && decl.getNamedImports().length) continue; // all type-only
@@ -1148,7 +1193,7 @@ function exposedExports(project: any): Map<any, Set<string>> {
         continue;
       }
       if (isServerOnlyImporter(sf) && !/\.(t|j)sx$/.test(sf.getFilePath())) continue;
-      const named = imp.decl.getNamedImports().filter((n: any) => !n.isTypeOnly());
+      const named = imp.decl.getNamedImports().filter((n: any) => !n.isTypeOnly() && !importsOnlyAType(n));
       const used = named
         .filter((n: any) => usedAsValue(sf, n.getAliasNode() ?? n.getNameNode()))
         .map((n: any) => n.getName());
@@ -1307,8 +1352,16 @@ function scan(repoPath: string): Finding[] {
       });
     }
   }
+  // An app whose other actions do check a session has authentication, even if
+  // it is hand-written (a cookie session table, a signed token): those
+  // unguarded actions are separate findings, not "add authentication".
+  if (findings.some((f) => f.verdict === "no_auth") &&
+      findings.some((f) => GUARDED.has(f.verdict))) {
+    for (const f of findings) if (f.verdict === "no_auth") f.verdict = "flagged";
+  }
   return findings;
 }
+const GUARDED = new Set<Verdict>(["guard_before_sink", "weak_guard", "idor_candidate"]);
 
 // --- CLI -------------------------------------------------------------------
 

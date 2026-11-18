@@ -1,0 +1,9 @@
+{
+  "checkInvite": "flagged",
+  "inviteUser": "flagged",
+  "renameNote": "guard_before_sink",
+  "renameTeam": "guard_before_sink",
+  "inviteToTeam": "guard_before_sink",
+  "inviteAsUser": "flagged",
+  "inviteWithAdminRpc": "flagged"
+}

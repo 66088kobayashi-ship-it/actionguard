@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: 66088kobayashi-ship-it/actionguard@v0.7.0
+      - uses: 66088kobayashi-ship-it/actionguard@v0.8.0
         # with:
         #   path: apps/web              # where the Next.js app lives
         #   fail-on-findings: "false"   # report without failing the job
@@ -275,6 +275,34 @@ labelled false positives, 213 with real findings), before and after:
 | `no_auth`: the repository has no auth library and no auth call | grouped 360 functions in 78 repositories into 78 findings | **kept**: nothing stops being reported. Units to review that were labelled false: 1,143 → 905 (−20%); all units to review: 3,217 → 2,935 (−8%) |
 
 The rejected rules are kept as test fixtures that must stay `flagged`.
+
+### v0.8.0: two misses, hand-written sessions, and fewer wrong "no authentication"
+
+Eight days of the daily scan (11–18 November 2026) left about 160 labelled false positives
+and two real holes the scanner had passed. Changes, each pinned by a fixture:
+
+| Change | Why |
+|---|---|
+| Values destructured from an argument stay tainted: `const { email, role } = data` | A real `inviteLabUser` (create any account, pick its role) was reported as `no_tainted_sink` after its author refactored to this shape |
+| `ilike` / `like` count as filters, and a client assigned after its declaration (`let sb; sb = admin()`) is traced | A real `checkInviteAction` read a whole profile row by email this way |
+| A helper that reads the session cookie and hashes it (`sha256`) or looks it up in a sessions table counts as authentication | Lucia-style hand-written sessions (`getCurrentSession()`) were not recognised |
+| Overloaded helpers resolve to the implementation, not the first overload signature | `requireIssueAccess(...)` checks were invisible: the overload has no body |
+| `rpc("check_permission" \| "has_permission" \| ...)` on the user's own client counts as a check; not on a service_role client, and not when the caller passes the user id | Supabase apps that keep permissions in a database function |
+| `no_auth` is not used when other actions in the repository do check a session | Apps with hand-written logins (a staff session table, a signed cookie) were told they had no authentication |
+| An import of type aliases or interfaces only (`import { ActionState } from ...`) does not put the module in the client bundle | The compiler drops it, so the actions behind it are not exposed |
+
+Regression over the same 410 labelled repositories, v0.7.0 → v0.8.0:
+
+- **Real findings no longer reported: 0.** No repository with a real finding lost all of its findings.
+- Labelled false positives no longer reported: 44 (helpers 22, session-scoped 17, unreachable 5).
+- Newly reported functions: 140, nearly all from the destructuring fix. In a random sample of
+  12, about 3 were real (a `borrowBook` / `returnMovie` that take the user id from the caller,
+  a store's sales by `storeId`); most others were sign-ups, logins and public forms.
+- Units to review: 2,902 → 3,014 (+4%). Missing real holes costs more than reading sign-up
+  forms, so the destructuring fix stays.
+
+On the 76 repositories from the daily scan that are not in that set, labelled false positives
+no longer reported: 33 of 240, with no real finding lost.
 
 ## The corpus
 
